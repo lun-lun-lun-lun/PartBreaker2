@@ -1,0 +1,598 @@
+--!strict
+--!native
+
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local ChunkBuilder = require(script.ChunkBuilder)
+local Connectivity = require(script.Connectivity)
+local DamageSolver = require(script.DamageSolver)
+local GreedyMesher = require(script.GreedyMesher)
+local JobScheduler = require(script.JobScheduler)
+local SupportGraph = require(script.SupportGraph)
+local VoxelGrid = require(script.VoxelGrid)
+local VoxelRegistry = require(script.VoxelRegistry)
+local Types = require(script.Types)
+
+local PartBreaker2 = {}
+
+type DestroyJob = Types.DestroyJob
+type DestroySphereJob = Types.DestroySphereJob
+type DestroyOBBJob = Types.DestroyOBBJob
+type VoxelPartConfig = Types.VoxelPartConfig
+type MakeDestructibleConfig = Types.MakeDestructibleConfig
+type RuntimeConfig = Types.RuntimeConfig
+type RuntimeBudgets = Types.RuntimeBudgets
+type RuntimeStats = Types.RuntimeStats
+type BudgetContext = Types.BudgetContext
+type RemovedVoxel = Types.RemovedVoxel
+type Record = VoxelRegistry.Record
+
+local DEBRIS_REMOTE_NAME = "PartBreaker2DebrisEvent"
+local NETWORK_FOLDER_NAME = "PartBreaker2Net"
+local DEBUG_STATS_INTERVAL = 0.75
+
+local runtimeFolder = ChunkBuilder.ensureRuntimeFolder()
+local registry = VoxelRegistry.new()
+local builder = ChunkBuilder.new(runtimeFolder)
+local remoteSeed = 0
+local scheduler = nil :: JobScheduler.Scheduler?
+local networkServer = nil :: any?
+local networkLoadAttempted = false
+local debugStatsConnection = nil :: RBXScriptConnection?
+
+local runtimeConfig: RuntimeConfig = {
+	budgets = nil,
+	debug = false,
+	statsReplicationInterval = DEBUG_STATS_INTERVAL,
+}
+
+local stats: RuntimeStats = {
+	jobsQueued = 0,
+	jobsCompleted = 0,
+	queueLength = 0,
+	recordsHit = 0,
+	recordsProcessed = 0,
+	voxelTests = 0,
+	voxelsRemoved = 0,
+	connectivityVisits = 0,
+	componentsExtracted = 0,
+	greedyVisits = 0,
+	cuboidsEmitted = 0,
+	partsCreated = 0,
+	partsReused = 0,
+	partsRetired = 0,
+	lazyGridsCreated = 0,
+	supportIslandParts = 0,
+	supportQueries = 0,
+	weldsDestroyed = 0,
+	weldsCreated = 0,
+	debrisEvents = 0,
+	debrisPositions = 0,
+	budgetYields = 0,
+	broadphaseMs = 0,
+	damageMs = 0,
+	connectivityMs = 0,
+	greedyMs = 0,
+	commitMs = 0,
+	supportMs = 0,
+}
+
+local function getOrCreateDebrisRemote(): RemoteEvent?
+	local existing = ReplicatedStorage:FindFirstChild(DEBRIS_REMOTE_NAME)
+	if existing and existing:IsA("RemoteEvent") then
+		return existing
+	end
+
+	if not RunService:IsServer() then
+		return nil
+	end
+
+	local remote = Instance.new("RemoteEvent")
+	remote.Name = DEBRIS_REMOTE_NAME
+	remote.Parent = ReplicatedStorage
+	return remote
+end
+
+local debrisRemote = getOrCreateDebrisRemote()
+
+local function getNetworkServer(): any?
+	if networkServer or networkLoadAttempted then
+		return networkServer
+	end
+
+	networkLoadAttempted = true
+	if not RunService:IsServer() then
+		return nil
+	end
+
+	local shared = ReplicatedStorage:FindFirstChild("Shared")
+	local folder = if shared then shared:FindFirstChild(NETWORK_FOLDER_NAME) else nil
+	local serverModule = if folder then folder:FindFirstChild("Server") else nil
+	if serverModule and serverModule:IsA("ModuleScript") then
+		local ok, result = pcall(require, serverModule)
+		if ok then
+			networkServer = result
+		else
+			warn(`PartBreaker2: failed to load Blink server module: {result}`)
+		end
+	end
+
+	return networkServer
+end
+
+local function fireDebugStats()
+	if not runtimeConfig.debug then
+		return
+	end
+
+	local server = getNetworkServer()
+	if not server or not server.DebugStats then
+		return
+	end
+
+	local snapshot = PartBreaker2.getStats()
+	server.DebugStats.FireAll({
+		QueueLength = math.min(65535, snapshot.queueLength),
+		JobsQueued = math.min(4294967295, snapshot.jobsQueued),
+		JobsCompleted = math.min(4294967295, snapshot.jobsCompleted),
+		RecordsProcessed = math.min(4294967295, snapshot.recordsProcessed),
+		VoxelTests = math.min(4294967295, snapshot.voxelTests),
+		VoxelsRemoved = math.min(4294967295, snapshot.voxelsRemoved),
+		ComponentsExtracted = math.min(4294967295, snapshot.componentsExtracted),
+		CuboidsEmitted = math.min(4294967295, snapshot.cuboidsEmitted),
+		PartsCreated = math.min(4294967295, snapshot.partsCreated),
+		PartsReused = math.min(4294967295, snapshot.partsReused),
+		SupportQueries = math.min(4294967295, snapshot.supportQueries),
+		WeldsCreated = math.min(4294967295, snapshot.weldsCreated),
+		WeldsDestroyed = math.min(4294967295, snapshot.weldsDestroyed),
+		BudgetYields = math.min(4294967295, snapshot.budgetYields),
+	})
+end
+
+local function ensureDebugStatsLoop()
+	if debugStatsConnection or not RunService:IsServer() then
+		return
+	end
+
+	local accumulator = 0
+	debugStatsConnection = RunService.Heartbeat:Connect(function(deltaTime)
+		if not runtimeConfig.debug then
+			return
+		end
+
+		accumulator += deltaTime
+		local interval = runtimeConfig.statsReplicationInterval or DEBUG_STATS_INTERVAL
+		if accumulator >= interval then
+			accumulator = 0
+			fireDebugStats()
+		end
+	end)
+end
+
+local function isSupportedVoxelSourcePart(instance: Instance): boolean
+	if instance:IsA("WedgePart") then
+		return true
+	end
+
+	if instance:IsA("Part") then
+		return instance.Shape == Enum.PartType.Block
+	end
+
+	return false
+end
+
+local function setAttributeDefault(instance: Instance, name: string, value: any, fallback: any, overrideExisting: boolean)
+	if value ~= nil then
+		instance:SetAttribute(name, value)
+	elseif overrideExisting or instance:GetAttribute(name) == nil then
+		instance:SetAttribute(name, fallback)
+	end
+end
+
+local function configToVoxelPartConfig(config: MakeDestructibleConfig?): VoxelPartConfig
+	if config == nil then
+		return {}
+	end
+
+	return {
+		voxelSize = config.voxelSize,
+		requiredStrength = config.requiredStrength,
+		debrisLifetime = config.debrisLifetime,
+		debrisImpulseMultiplier = config.debrisImpulseMultiplier,
+		maxDebrisVoxels = config.maxDebrisVoxels,
+		maxCuboids = config.maxCuboids,
+		lazyGeneratedGrid = config.lazyGeneratedGrid,
+	}
+end
+
+local function getRecordGrid(record: Record, context: BudgetContext?): VoxelGrid.Grid
+	return registry:ensureGrid(record, context)
+end
+
+local function getInheritedConfig(record: Record, context: BudgetContext?): VoxelPartConfig
+	local grid = getRecordGrid(record, context)
+	return {
+		voxelSize = grid.voxelSize,
+		requiredStrength = record.requiredStrength,
+		debrisLifetime = record.debrisLifetime,
+		debrisImpulseMultiplier = record.debrisImpulseMultiplier,
+		maxDebrisVoxels = record.maxDebrisVoxels,
+		maxCuboids = record.maxCuboids,
+		lazyGeneratedGrid = true,
+	}
+end
+
+local function addMs(field: string, startedAt: number)
+	(stats :: any)[field] += (os.clock() - startedAt) * 1000
+end
+
+local function sampleDebrisPositions(record: Record, removed: { RemovedVoxel }, context: BudgetContext?): { Vector3 }
+	local grid = getRecordGrid(record, context)
+	local limit = math.min(record.maxDebrisVoxels, #removed)
+	local positions = table.create(limit)
+	if limit <= 0 then
+		return positions
+	end
+
+	local stride = math.max(1, math.ceil(#removed / limit))
+	local emitted = 0
+
+	for index = 1, #removed, stride do
+		local removedVoxel = removed[index]
+		local localCenter = VoxelGrid.indexCenter(grid, removedVoxel.index)
+		emitted += 1
+		positions[emitted] = record.part.CFrame * localCenter
+		if emitted >= limit then
+			break
+		end
+	end
+
+	return positions
+end
+
+local function appendUniquePart(parts: { BasePart }, seen: { [BasePart]: boolean }, part: BasePart)
+	if seen[part] then
+		return
+	end
+
+	seen[part] = true
+	parts[#parts + 1] = part
+end
+
+local function appendAssemblyParts(parts: { BasePart }, seen: { [BasePart]: boolean }, assemblyParts: { BasePart })
+	for _, part in assemblyParts do
+		appendUniquePart(parts, seen, part)
+	end
+end
+
+local function applyImpulseToRoots(roots: { BasePart }, impulse: Vector3?)
+	if not impulse or impulse.Magnitude <= 0 then
+		return
+	end
+
+	for _, root in roots do
+		local scaledImpulse = impulse * math.max(1, root.AssemblyMass)
+		task.defer(function()
+			if root.Parent ~= nil and not root.Anchored then
+				root:ApplyImpulse(scaledImpulse)
+			end
+		end)
+	end
+end
+
+local function fireDebris(record: Record, removed: { RemovedVoxel }, impulse: Vector3?, context: BudgetContext?)
+	if #removed <= 0 then
+		return
+	end
+
+	local positions = sampleDebrisPositions(record, removed, context)
+	if #positions <= 0 then
+		return
+	end
+
+	remoteSeed = (remoteSeed + 1) % 2147483647
+	stats.debrisEvents += 1
+	stats.debrisPositions += #positions
+
+	local grid = getRecordGrid(record, context)
+	local scaledImpulse = (impulse or Vector3.zero) * record.debrisImpulseMultiplier
+	local server = getNetworkServer()
+	if server and server.Debris then
+		server.Debris.FireAll({
+			Seed = remoteSeed,
+			Positions = positions,
+			CellSize = grid.cellSize,
+			Color = record.color,
+			Material = record.material.Value,
+			Impulse = scaledImpulse,
+			Lifetime = record.debrisLifetime,
+		})
+	elseif debrisRemote then
+		debrisRemote:FireAllClients({
+			seed = remoteSeed,
+			positions = positions,
+			cellSize = grid.cellSize,
+			color = record.color,
+			material = record.material.Name,
+			impulse = scaledImpulse,
+			lifetime = record.debrisLifetime,
+		})
+	end
+end
+
+local function retireRecord(record: Record, oldAssemblyParts: { BasePart }, context: BudgetContext?)
+	registry:destroyWeldsTouchingParts(oldAssemblyParts, context)
+	registry:unregisterRecord(record)
+
+	if record.part:GetAttribute("_PartBreaker2GeneratedChunk") == true then
+		builder:retirePart(record.part, context)
+	else
+		ChunkBuilder.hideSourcePart(record.part, context)
+	end
+
+	for _, chunk in record.chunks do
+		registry:unregisterQueryPart(chunk)
+	end
+end
+
+local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetContext)
+	local grid = getRecordGrid(record, context)
+	local oldAssemblyParts = registry:getAssemblyParts(record.assemblyId)
+	local oldCFrame = record.part.CFrame
+	local oldSize = record.part.Size
+	local dirtySeedParts = table.create(#oldAssemblyParts + 8)
+	local dirtySeedSet: { [BasePart]: boolean } = {}
+	appendAssemblyParts(dirtySeedParts, dirtySeedSet, oldAssemblyParts)
+
+	local startedAt = os.clock()
+	local components = Connectivity.extractComponents(grid, context)
+	addMs("connectivityMs", startedAt)
+
+	startedAt = os.clock()
+	for componentIndex, component in components do
+		component.id = componentIndex
+		component.record = record
+		component.assemblyId = registry:allocateAssemblyId()
+		component.supported = false
+		component.cuboids = GreedyMesher.meshComponent(grid, component, record.maxCuboids, context)
+	end
+	addMs("greedyMs", startedAt)
+
+	local inheritedConfig = getInheritedConfig(record, context)
+	local model = record.model
+	local newParts = table.create(16)
+	local newPartSet: { [BasePart]: boolean } = {}
+
+	startedAt = os.clock()
+	local builtAssemblies = builder:buildChunks(record, components, context, inheritedConfig.lazyGeneratedGrid ~= false)
+	retireRecord(record, oldAssemblyParts, context)
+
+	for _, builtAssembly in builtAssemblies do
+		registry:registerAssembly(
+			builtAssembly.assemblyId,
+			builtAssembly.parts,
+			builtAssembly.rootPart,
+			builtAssembly.supported
+		)
+
+		for _, chunk in builtAssembly.parts do
+			appendUniquePart(newParts, newPartSet, chunk)
+			appendUniquePart(dirtySeedParts, dirtySeedSet, chunk)
+			registry:configureVoxelPart(chunk, inheritedConfig)
+			registry:registerPart(model, chunk)
+		end
+	end
+	builder:flushBulkMoves()
+	addMs("commitMs", startedAt)
+
+	startedAt = os.clock()
+	local queryPadding = math.max(2, grid.voxelSize * 2)
+	local refreshResult = SupportGraph.refreshAroundDamage(
+		registry,
+		dirtySeedParts,
+		oldCFrame,
+		oldSize + Vector3.new(queryPadding, queryPadding, queryPadding),
+		newParts,
+		context
+	)
+	builder:flushBulkMoves()
+	addMs("supportMs", startedAt)
+
+	applyImpulseToRoots(refreshResult.unsupportedNewRoots, impulse)
+end
+
+local function processRecordDamage(record: Record, removed: { RemovedVoxel }, impulse: Vector3?, context: BudgetContext)
+	if #removed <= 0 then
+		return
+	end
+
+	fireDebris(record, removed, impulse, context)
+	rebuildRecord(record, impulse, context)
+end
+
+local function processSphere(context: BudgetContext, job: DestroySphereJob)
+	local startedAt = os.clock()
+	local records = registry:querySphere(job.position, job.radius)
+	addMs("broadphaseMs", startedAt)
+	stats.recordsHit += #records
+
+	for _, record in records do
+		context:consume("records", 1)
+		stats.recordsProcessed += 1
+		getRecordGrid(record, context)
+
+		startedAt = os.clock()
+		local result = DamageSolver.applySphere(record, job.position, job.radius, job.strength, context)
+		addMs("damageMs", startedAt)
+		processRecordDamage(record, result.removed, job.impulse, context)
+	end
+end
+
+local function processOBB(context: BudgetContext, job: DestroyOBBJob)
+	local startedAt = os.clock()
+	local records = registry:queryOBB(job.cframe, job.size)
+	addMs("broadphaseMs", startedAt)
+	stats.recordsHit += #records
+
+	for _, record in records do
+		context:consume("records", 1)
+		stats.recordsProcessed += 1
+		getRecordGrid(record, context)
+
+		startedAt = os.clock()
+		local result = DamageSolver.applyOBB(record, job.cframe, job.size, job.strength, context)
+		addMs("damageMs", startedAt)
+		processRecordDamage(record, result.removed, job.impulse, context)
+	end
+end
+
+local function enqueueDestroyJob(job: DestroyJob)
+	if not scheduler then
+		return
+	end
+
+	local name = if job.kind == "sphere" then "destroySphere" else "destroyOBB"
+	scheduler:enqueue(name, function(context: BudgetContext)
+		if job.kind == "sphere" then
+			processSphere(context, job :: DestroySphereJob)
+		else
+			processOBB(context, job :: DestroyOBBJob)
+		end
+	end)
+end
+
+if RunService:IsServer() then
+	scheduler = JobScheduler.new(stats, runtimeConfig.budgets)
+	ensureDebugStatsLoop()
+	getNetworkServer()
+end
+
+function PartBreaker2.configureRuntime(config: RuntimeConfig)
+	if config.budgets ~= nil then
+		runtimeConfig.budgets = config.budgets
+		if scheduler then
+			scheduler:configure(config.budgets :: RuntimeBudgets)
+		end
+	end
+
+	if config.debug ~= nil then
+		runtimeConfig.debug = config.debug
+	end
+
+	if config.statsReplicationInterval ~= nil then
+		runtimeConfig.statsReplicationInterval = config.statsReplicationInterval
+	end
+end
+
+function PartBreaker2.getStats(): RuntimeStats
+	if scheduler then
+		stats.queueLength = scheduler:pendingCount()
+	end
+
+	local copy = {} :: any
+	for key, value in stats do
+		copy[key] = value
+	end
+	return copy :: RuntimeStats
+end
+
+function PartBreaker2.flushPendingJobs(maxFrames: number?)
+	if scheduler then
+		scheduler:flush(maxFrames)
+	end
+end
+
+function PartBreaker2.registerModel(model: Model)
+	registry:registerModel(model)
+end
+
+function PartBreaker2.unregisterModel(model: Model)
+	registry:unregisterModel(model)
+end
+
+function PartBreaker2.configureVoxelPart(part: BasePart, config: VoxelPartConfig)
+	registry:configureVoxelPart(part, config)
+end
+
+function PartBreaker2.makeModelDestructible(model: Model, config: MakeDestructibleConfig?): number
+	local overrideExisting = if config then config.overrideExistingAttributes == true else false
+	local configuredCount = 0
+	local voxelConfig = configToVoxelPartConfig(config)
+
+	model:SetAttribute("VoxelModel", true)
+	if RunService:IsServer() then
+		CollectionService:AddTag(model, "VoxelModel")
+	end
+
+	for _, descendant in model:GetDescendants() do
+		if not isSupportedVoxelSourcePart(descendant) then
+			continue
+		end
+
+		local part = descendant :: BasePart
+		part:SetAttribute("VoxelPart", true)
+		setAttributeDefault(part, "VoxelSize", if config then config.voxelSize else nil, 2, overrideExisting)
+		setAttributeDefault(part, "RequiredStrength", if config then config.requiredStrength else nil, 0, overrideExisting)
+		setAttributeDefault(part, "MaxCuboids", if config then config.maxCuboids else nil, 256, overrideExisting)
+		setAttributeDefault(part, "MaxDebrisVoxels", if config then config.maxDebrisVoxels else nil, 64, overrideExisting)
+		setAttributeDefault(part, "DebrisLifetime", if config then config.debrisLifetime else nil, 2.5, overrideExisting)
+		setAttributeDefault(part, "DebrisImpulseMultiplier", if config then config.debrisImpulseMultiplier else nil, 1, overrideExisting)
+		setAttributeDefault(part, "VoxelSupport", if config then config.supportMode else nil, if part.Anchored then "Bottom" else "None", overrideExisting)
+		setAttributeDefault(part, "PartBreaker2LazyGrid", false, false, overrideExisting)
+
+		registry:configureVoxelPart(part, voxelConfig)
+		configuredCount += 1
+	end
+
+	if config == nil or config.register ~= false then
+		PartBreaker2.registerModel(model)
+	end
+
+	return configuredCount
+end
+
+function PartBreaker2.destroySphere(position: Vector3, radius: number, strength: number, impulse: Vector3?)
+	enqueueDestroyJob({
+		kind = "sphere",
+		position = position,
+		radius = radius,
+		strength = strength,
+		impulse = impulse,
+	})
+end
+
+function PartBreaker2.destroyOBB(cframe: CFrame, size: Vector3, strength: number, impulse: Vector3?)
+	enqueueDestroyJob({
+		kind = "obb",
+		cframe = cframe,
+		size = size,
+		strength = strength,
+		impulse = impulse,
+	})
+end
+
+function PartBreaker2.registerTaggedModels()
+	for _, instance in CollectionService:GetTagged("VoxelModel") do
+		if instance:IsA("Model") then
+			PartBreaker2.registerModel(instance)
+		end
+	end
+end
+
+function PartBreaker2.registerAttributedModels(root: Instance?)
+	local searchRoot = root or Workspace
+	for _, instance in searchRoot:GetDescendants() do
+		if instance:IsA("Model") and instance:GetAttribute("VoxelModel") == true then
+			PartBreaker2.registerModel(instance)
+		end
+	end
+end
+
+function PartBreaker2.getRuntimeFolder(): Folder
+	return runtimeFolder
+end
+
+return PartBreaker2

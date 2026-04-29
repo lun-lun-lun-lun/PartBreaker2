@@ -1,0 +1,55 @@
+option Casing = Pascal
+option RemoteScope = "PB2"
+option ServerOutput = "./PartBreaker2Net/Server.luau"
+option ClientOutput = "./PartBreaker2Net/Client.luau"
+option TypesOutput = "./PartBreaker2Net/Types.luau"
+option ManualReplication = false
+option WriteValidations = true
+
+struct DebrisPayload {
+	Seed: u32,
+	Positions: vector[0..64],
+	CellSize: vector,
+	Color: Color3,
+	Material: u16,
+	Impulse: vector,
+	Lifetime: f16,
+}
+
+struct DebugStatsPayload {
+	QueueLength: u16,
+	JobsQueued: u32,
+	JobsCompleted: u32,
+	RecordsProcessed: u32,
+	VoxelTests: u32,
+	VoxelsRemoved: u32,
+	ComponentsExtracted: u32,
+	CuboidsEmitted: u32,
+	PartsCreated: u32,
+	PartsReused: u32,
+	SupportQueries: u32,
+	WeldsCreated: u32,
+	WeldsDestroyed: u32,
+	BudgetYields: u32,
+}
+
+event Debris {
+	From: Server,
+	Type: Unreliable,
+	Call: ManyAsync,
+	Data: DebrisPayload
+}
+
+event DebugStats {
+	From: Server,
+	Type: Reliable,
+	Call: ManyAsync,
+	Data: DebugStatsPayload
+}
+
+event ToolActivated {
+	From: Client,
+	Type: Reliable,
+	Call: ManyAsync,
+	Data: vector
+}
