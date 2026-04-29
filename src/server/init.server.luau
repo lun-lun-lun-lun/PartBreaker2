@@ -19,6 +19,7 @@ local PROJECTILE_DEBRIS_IMPULSE = 55
 
 PartBreaker2.configureRuntime({
 	debug = false,
+	logDestructionTimings = true,
 	budgets = {
 		maxTasksPerFrame = 400,
 		maxRecordsPerFrame = 300,
@@ -44,7 +45,7 @@ if house and house:IsA("Model") then
 		requiredStrength = 0,
 		supportMode = "Bottom",
 		maxCuboids = 256,
-		maxDebrisVoxels = 20,
+		maxDebrisVoxels = 5,
 		debrisLifetime = 2.5,
 		overrideExistingAttributes = false,
 		lazyGeneratedGrid = true,
@@ -59,7 +60,7 @@ if wall and wall:IsA("Model") then
 		requiredStrength = 0,
 		supportMode = "Bottom",
 		maxCuboids = 256,
-		maxDebrisVoxels = 64,
+		maxDebrisVoxels = 10,
 		debrisLifetime = 2.5,
 		overrideExistingAttributes = false,
 		lazyGeneratedGrid = true,

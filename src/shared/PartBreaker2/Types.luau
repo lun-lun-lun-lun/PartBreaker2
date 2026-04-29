@@ -38,6 +38,8 @@ export type RuntimeConfig = {
 	budgets: RuntimeBudgets?,
 	debug: boolean?,
 	statsReplicationInterval: number?,
+	debrisLodRadius: number?,
+	logDestructionTimings: boolean?,
 }
 
 export type RuntimeStats = {
@@ -58,13 +60,22 @@ export type RuntimeStats = {
 	lazyGridsCreated: number,
 	supportIslandParts: number,
 	supportQueries: number,
+	supportHashCandidates: number,
+	supportContactTests: number,
+	supportEdgesRebuilt: number,
+	supportComponentsVisited: number,
+	supportWorkspaceQueries: number,
 	weldsDestroyed: number,
 	weldsCreated: number,
+	weldsReused: number,
 	debrisEvents: number,
 	debrisPositions: number,
+	debrisLodSkipped: number,
 	budgetYields: number,
+	gridMs: number,
 	broadphaseMs: number,
 	damageMs: number,
+	debrisMs: number,
 	connectivityMs: number,
 	greedyMs: number,
 	commitMs: number,
@@ -102,6 +113,8 @@ export type BudgetKey =
 export type BudgetContext = {
 	consume: (BudgetContext, BudgetKey, number?) -> (),
 	stats: RuntimeStats,
+	profile: any?,
+	setProfile: (BudgetContext, any?) -> (),
 }
 
 export type RemovedVoxel = {

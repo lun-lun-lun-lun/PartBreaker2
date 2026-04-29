@@ -3,6 +3,7 @@
 
 local Workspace = game:GetService("Workspace")
 
+local SpatialHash = require(script.Parent.SpatialHash)
 local VoxelGrid = require(script.Parent.VoxelGrid)
 local Types = require(script.Parent.Types)
 
@@ -10,6 +11,7 @@ local VoxelRegistry = {}
 VoxelRegistry.__index = VoxelRegistry
 
 type VoxelPartConfig = Types.VoxelPartConfig
+type SupportHash = SpatialHash.Hash
 
 export type Record = {
 	model: Model,
@@ -39,6 +41,7 @@ export type Assembly = {
 	rootPart: BasePart?,
 	parts: { [BasePart]: true },
 	welds: { [WeldConstraint]: true },
+	weldByPart: { [BasePart]: WeldConstraint },
 	partCount: number,
 	weldCount: number,
 }
@@ -49,6 +52,10 @@ export type Registry = typeof(setmetatable(
 		recordsByQueryPart: { [BasePart]: Record },
 		assembliesById: { [number]: Assembly },
 		assemblyByPart: { [BasePart]: Assembly },
+		supportHash: SupportHash,
+		contactNeighborsByPart: { [BasePart]: { [BasePart]: true } },
+		directSupportByPart: { [BasePart]: boolean },
+		supportContactsValid: { [BasePart]: boolean },
 		pendingConfig: { [BasePart]: VoxelPartConfig },
 		overlapParams: OverlapParams,
 		maxBroadphaseParts: number,
@@ -62,6 +69,77 @@ local DEFAULT_MAX_CUBOIDS = 256
 local DEFAULT_MAX_DEBRIS = 64
 local DEFAULT_DEBRIS_LIFETIME = 2.5
 local DEFAULT_DEBRIS_IMPULSE_MULTIPLIER = 1
+local SUPPORT_HASH_CELL_SIZE = 16
+local CONTACT_PADDING = 0.015
+
+local function abs(value: number): number
+	return if value < 0 then -value else value
+end
+
+local function obbTouches(cframeA: CFrame, sizeA: Vector3, cframeB: CFrame, sizeB: Vector3, padding: number): boolean
+	local aHalf = sizeA * 0.5 + Vector3.new(padding, padding, padding)
+	local bHalf = sizeB * 0.5 + Vector3.new(padding, padding, padding)
+	local aAxes = {
+		cframeA.RightVector,
+		cframeA.UpVector,
+		cframeA.LookVector,
+	}
+	local bAxes = {
+		cframeB.RightVector,
+		cframeB.UpVector,
+		cframeB.LookVector,
+	}
+	local centerDelta = cframeB.Position - cframeA.Position
+	local epsilon = 1e-6
+
+	for _, axis in aAxes do
+		local distance = abs(centerDelta:Dot(axis))
+		local radiusA = if axis == aAxes[1] then aHalf.X elseif axis == aAxes[2] then aHalf.Y else aHalf.Z
+		local radiusB = bHalf.X * abs(axis:Dot(bAxes[1]))
+			+ bHalf.Y * abs(axis:Dot(bAxes[2]))
+			+ bHalf.Z * abs(axis:Dot(bAxes[3]))
+		if distance > radiusA + radiusB + epsilon then
+			return false
+		end
+	end
+
+	for _, axis in bAxes do
+		local distance = abs(centerDelta:Dot(axis))
+		local radiusA = aHalf.X * abs(axis:Dot(aAxes[1]))
+			+ aHalf.Y * abs(axis:Dot(aAxes[2]))
+			+ aHalf.Z * abs(axis:Dot(aAxes[3]))
+		local radiusB = if axis == bAxes[1] then bHalf.X elseif axis == bAxes[2] then bHalf.Y else bHalf.Z
+		if distance > radiusA + radiusB + epsilon then
+			return false
+		end
+	end
+
+	for _, axisA in aAxes do
+		for _, axisB in bAxes do
+			local axis = axisA:Cross(axisB)
+			if axis:Dot(axis) <= epsilon then
+				continue
+			end
+
+			local distance = abs(centerDelta:Dot(axis))
+			local radiusA = aHalf.X * abs(axis:Dot(aAxes[1]))
+				+ aHalf.Y * abs(axis:Dot(aAxes[2]))
+				+ aHalf.Z * abs(axis:Dot(aAxes[3]))
+			local radiusB = bHalf.X * abs(axis:Dot(bAxes[1]))
+				+ bHalf.Y * abs(axis:Dot(bAxes[2]))
+				+ bHalf.Z * abs(axis:Dot(bAxes[3]))
+			if distance > radiusA + radiusB + epsilon then
+				return false
+			end
+		end
+	end
+
+	return true
+end
+
+local function expandedSize(part: BasePart): Vector3
+	return part.Size + Vector3.new(CONTACT_PADDING * 2, CONTACT_PADDING * 2, CONTACT_PADDING * 2)
+end
 
 local function numberAttribute(part: Instance, name: string, fallback: number): number
 	local value = part:GetAttribute(name)
@@ -94,6 +172,26 @@ local function isVoxelPart(part: BasePart): boolean
 	return isBlockPart(part) or part:IsA("WedgePart")
 end
 
+local function isExplicitSupportAnchor(part: BasePart): boolean
+	return part:GetAttribute("PartBreaker2SupportAnchor") == true
+end
+
+local function isExternalSupport(registry: Registry, part: BasePart): boolean
+	if part.Parent == nil then
+		return false
+	end
+
+	if isExplicitSupportAnchor(part) then
+		return true
+	end
+
+	if registry.recordsBySource[part] ~= nil or part:GetAttribute("VoxelPart") == true then
+		return false
+	end
+
+	return part.Anchored
+end
+
 local function mergedConfig(part: BasePart, pending: VoxelPartConfig?): VoxelPartConfig
 	local voxelSize = if pending and pending.voxelSize then pending.voxelSize else numberAttribute(part, "VoxelSize", DEFAULT_VOXEL_SIZE)
 	local requiredStrength = if pending and pending.requiredStrength then pending.requiredStrength else numberAttribute(part, "RequiredStrength", 0)
@@ -123,6 +221,10 @@ function VoxelRegistry.new(): Registry
 		recordsByQueryPart = {},
 		assembliesById = {},
 		assemblyByPart = {},
+		supportHash = SpatialHash.new(SUPPORT_HASH_CELL_SIZE),
+		contactNeighborsByPart = {},
+		directSupportByPart = {},
+		supportContactsValid = {},
 		pendingConfig = {},
 		overlapParams = overlapParams,
 		maxBroadphaseParts = 0,
@@ -136,6 +238,162 @@ function VoxelRegistry.allocateAssemblyId(self: Registry): number
 	return id
 end
 
+local function getContactSet(self: Registry, part: BasePart): { [BasePart]: true }
+	local set = self.contactNeighborsByPart[part]
+	if not set then
+		set = {}
+		self.contactNeighborsByPart[part] = set
+	end
+	return set
+end
+
+local function addContactEdge(self: Registry, a: BasePart, b: BasePart, context: any?)
+	if a == b then
+		return
+	end
+
+	local aSet = getContactSet(self, a)
+	if aSet[b] then
+		return
+	end
+
+	aSet[b] = true
+	getContactSet(self, b)[a] = true
+	if context then
+		context.stats.supportEdgesRebuilt += 1
+	end
+end
+
+function VoxelRegistry.removeSupportPart(self: Registry, part: BasePart)
+	self.supportHash:remove(part)
+
+	local neighbors = self.contactNeighborsByPart[part]
+	if neighbors then
+		for neighbor in neighbors do
+			local neighborSet = self.contactNeighborsByPart[neighbor]
+			if neighborSet then
+				neighborSet[part] = nil
+			end
+		end
+	end
+
+	self.contactNeighborsByPart[part] = nil
+	self.directSupportByPart[part] = nil
+	self.supportContactsValid[part] = nil
+end
+
+function VoxelRegistry.getContactNeighborSet(self: Registry, part: BasePart): { [BasePart]: true }?
+	return self.contactNeighborsByPart[part]
+end
+
+function VoxelRegistry.getContactNeighbors(self: Registry, part: BasePart): { BasePart }
+	local set = self.contactNeighborsByPart[part]
+	if not set then
+		return {}
+	end
+
+	local neighbors = {}
+	for neighbor in set do
+		if self:isActiveVoxelPart(neighbor) then
+			neighbors[#neighbors + 1] = neighbor
+		end
+	end
+	return neighbors
+end
+
+function VoxelRegistry.hasDirectSupport(self: Registry, part: BasePart): boolean
+	return self.directSupportByPart[part] == true
+end
+
+function VoxelRegistry.getNearbySupportParts(self: Registry, cframe: CFrame, size: Vector3, padding: number?, context: any?): { BasePart }
+	local nearby = self.supportHash:queryAABB(cframe, size, padding or CONTACT_PADDING, nil)
+	if context then
+		context.stats.supportHashCandidates += #nearby
+	end
+	return nearby
+end
+
+function VoxelRegistry.rebuildSupportContacts(self: Registry, parts: { BasePart }, context: any?)
+	local dirtyParts = {}
+	local dirtySet: { [BasePart]: boolean } = {}
+
+	for _, part in parts do
+		if dirtySet[part] then
+			continue
+		end
+		dirtySet[part] = true
+
+		if self:isActiveVoxelPart(part) then
+			self.supportHash:update(part)
+			dirtyParts[#dirtyParts + 1] = part
+		else
+			self:removeSupportPart(part)
+		end
+	end
+
+	for _, part in dirtyParts do
+		local oldNeighbors = self.contactNeighborsByPart[part]
+		if oldNeighbors then
+			for neighbor in oldNeighbors do
+				local neighborSet = self.contactNeighborsByPart[neighbor]
+				if neighborSet then
+					neighborSet[part] = nil
+				end
+			end
+		end
+
+		self.contactNeighborsByPart[part] = {}
+		self.directSupportByPart[part] = false
+		self.supportContactsValid[part] = true
+	end
+
+	local overlapParams = self.overlapParams
+	for _, part in dirtyParts do
+		for _, candidate in self:getNearbySupportParts(part.CFrame, part.Size, CONTACT_PADDING, context) do
+			if candidate == part or not self:isActiveVoxelPart(candidate) then
+				continue
+			end
+
+			if context then
+				context.stats.supportContactTests += 1
+			end
+			if obbTouches(part.CFrame, part.Size, candidate.CFrame, candidate.Size, CONTACT_PADDING) then
+				addContactEdge(self, part, candidate, context)
+			end
+		end
+
+		if context then
+			context:consume("supportQueries", 1)
+			context.stats.supportQueries += 1
+			context.stats.supportWorkspaceQueries += 1
+		end
+		for _, nearbyPart in Workspace:GetPartBoundsInBox(part.CFrame, expandedSize(part), overlapParams) do
+			if not nearbyPart:IsA("BasePart") or nearbyPart == part then
+				continue
+			end
+			if not isExternalSupport(self, nearbyPart) then
+				continue
+			end
+
+			if context then
+				context.stats.supportContactTests += 1
+			end
+			if obbTouches(part.CFrame, part.Size, nearbyPart.CFrame, nearbyPart.Size, CONTACT_PADDING) then
+				self.directSupportByPart[part] = true
+				break
+			end
+		end
+	end
+end
+
+function VoxelRegistry.ensureSupportContacts(self: Registry, part: BasePart, context: any?)
+	if self.supportContactsValid[part] and self:isActiveVoxelPart(part) then
+		return
+	end
+
+	self:rebuildSupportContacts({ part }, context)
+end
+
 function VoxelRegistry.registerAssembly(self: Registry, assemblyId: number, parts: { BasePart }, rootPart: BasePart?, supported: boolean): Assembly
 	local assembly = self.assembliesById[assemblyId]
 	if not assembly then
@@ -145,6 +403,7 @@ function VoxelRegistry.registerAssembly(self: Registry, assemblyId: number, part
 			rootPart = rootPart,
 			parts = {},
 			welds = {},
+			weldByPart = {},
 			partCount = 0,
 			weldCount = 0,
 		}
@@ -180,13 +439,44 @@ function VoxelRegistry.registerWeld(self: Registry, assemblyId: number, weld: We
 
 	assembly.welds[weld] = true
 	assembly.weldCount += 1
+
+	local part1 = weld.Part1
+	if part1 then
+		assembly.weldByPart[part1] = weld
+	end
+
 	weld.Destroying:Once(function()
 		local currentAssembly = self.assembliesById[assemblyId]
 		if currentAssembly and currentAssembly.welds[weld] then
 			currentAssembly.welds[weld] = nil
 			currentAssembly.weldCount -= 1
+			if part1 and currentAssembly.weldByPart[part1] == weld then
+				currentAssembly.weldByPart[part1] = nil
+			end
 		end
 	end)
+end
+
+-- Detach a weld from its old assembly's bookkeeping (without destroying the
+-- WeldConstraint instance) so it can be re-registered to a new assembly.
+function VoxelRegistry.detachWeldFromAssembly(self: Registry, assembly: Assembly, weld: WeldConstraint)
+	if not assembly.welds[weld] then
+		return
+	end
+	assembly.welds[weld] = nil
+	assembly.weldCount -= 1
+	local part1 = weld.Part1
+	if part1 and assembly.weldByPart[part1] == weld then
+		assembly.weldByPart[part1] = nil
+	end
+end
+
+function VoxelRegistry.getWeldForPart(self: Registry, part: BasePart): WeldConstraint?
+	local assembly = self.assemblyByPart[part]
+	if not assembly then
+		return nil
+	end
+	return assembly.weldByPart[part]
 end
 
 function VoxelRegistry.destroyWeldsTouchingParts(self: Registry, parts: { BasePart }, context: any?)
@@ -263,6 +553,10 @@ function VoxelRegistry.clearAssembliesForParts(self: Registry, parts: { BasePart
 			assembly.partCount -= 1
 		end
 
+		if assembly.weldByPart[part] then
+			assembly.weldByPart[part] = nil
+		end
+
 		if assembly.rootPart == part then
 			assembly.rootPart = nil
 		end
@@ -285,6 +579,10 @@ function VoxelRegistry.unregisterAssemblyPart(self: Registry, part: BasePart)
 	if assembly.parts[part] then
 		assembly.parts[part] = nil
 		assembly.partCount -= 1
+	end
+
+	if assembly.weldByPart[part] then
+		assembly.weldByPart[part] = nil
 	end
 
 	if assembly.rootPart == part then
@@ -402,6 +700,8 @@ function VoxelRegistry.registerPart(self: Registry, model: Model, part: BasePart
 
 	self.recordsBySource[part] = record
 	self.recordsByQueryPart[part] = record
+	self.supportHash:insert(part)
+	self.supportContactsValid[part] = false
 	part:SetAttribute("_PartBreaker2Registered", true)
 	part:SetAttribute("PartBreaker2AssemblyId", record.assemblyId)
 	part:SetAttribute("PartBreaker2Supported", record.supported)
@@ -434,6 +734,7 @@ end
 function VoxelRegistry.unregisterRecord(self: Registry, record: Record)
 	self.recordsBySource[record.part] = nil
 	self.recordsByQueryPart[record.part] = nil
+	self:removeSupportPart(record.part)
 	self:unregisterAssemblyPart(record.part)
 	record.part:SetAttribute("_PartBreaker2Registered", nil)
 	for _, chunk in record.chunks do

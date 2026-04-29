@@ -2,6 +2,7 @@
 --!native
 
 local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
@@ -30,14 +31,24 @@ type BudgetContext = Types.BudgetContext
 type RemovedVoxel = Types.RemovedVoxel
 type Record = VoxelRegistry.Record
 
+type DestructionProfile = {
+	id: number,
+	kind: string,
+	startedAt: number,
+	counts: { [string]: number },
+	timings: { [string]: number },
+}
+
 local DEBRIS_REMOTE_NAME = "PartBreaker2DebrisEvent"
 local NETWORK_FOLDER_NAME = "PartBreaker2Net"
 local DEBUG_STATS_INTERVAL = 0.75
+local DEFAULT_DEBRIS_LOD_RADIUS = 200
 
 local runtimeFolder = ChunkBuilder.ensureRuntimeFolder()
 local registry = VoxelRegistry.new()
 local builder = ChunkBuilder.new(runtimeFolder)
 local remoteSeed = 0
+local destructionProfileSerial = 0
 local scheduler = nil :: JobScheduler.Scheduler?
 local networkServer = nil :: any?
 local networkLoadAttempted = false
@@ -47,6 +58,8 @@ local runtimeConfig: RuntimeConfig = {
 	budgets = nil,
 	debug = false,
 	statsReplicationInterval = DEBUG_STATS_INTERVAL,
+	debrisLodRadius = DEFAULT_DEBRIS_LOD_RADIUS,
+	logDestructionTimings = false,
 }
 
 local stats: RuntimeStats = {
@@ -67,13 +80,22 @@ local stats: RuntimeStats = {
 	lazyGridsCreated = 0,
 	supportIslandParts = 0,
 	supportQueries = 0,
+	supportHashCandidates = 0,
+	supportContactTests = 0,
+	supportEdgesRebuilt = 0,
+	supportComponentsVisited = 0,
+	supportWorkspaceQueries = 0,
 	weldsDestroyed = 0,
 	weldsCreated = 0,
+	weldsReused = 0,
 	debrisEvents = 0,
 	debrisPositions = 0,
+	debrisLodSkipped = 0,
 	budgetYields = 0,
+	gridMs = 0,
 	broadphaseMs = 0,
 	damageMs = 0,
+	debrisMs = 0,
 	connectivityMs = 0,
 	greedyMs = 0,
 	commitMs = 0,
@@ -225,8 +247,135 @@ local function getInheritedConfig(record: Record, context: BudgetContext?): Voxe
 	}
 end
 
-local function addMs(field: string, startedAt: number)
-	(stats :: any)[field] += (os.clock() - startedAt) * 1000
+local function addProfileCount(context: BudgetContext?, key: string, amount: number)
+	if not context or amount == 0 then
+		return
+	end
+
+	local profile = context.profile
+	if not profile then
+		return
+	end
+
+	local counts = profile.counts
+	counts[key] = (counts[key] or 0) + amount
+end
+
+local function addMs(field: string, startedAt: number, context: BudgetContext?)
+	local elapsedMs = (os.clock() - startedAt) * 1000
+	(stats :: any)[field] += elapsedMs
+
+	if context and context.profile then
+		local timings = context.profile.timings
+		timings[field] = (timings[field] or 0) + elapsedMs
+	end
+end
+
+local function ms(profile: DestructionProfile, field: string): number
+	return profile.timings[field] or 0
+end
+
+local function count(profile: DestructionProfile, field: string): number
+	return profile.counts[field] or 0
+end
+
+local function beginDestructionProfile(job: DestroyJob): DestructionProfile
+	destructionProfileSerial += 1
+	return {
+		id = destructionProfileSerial,
+		kind = job.kind,
+		startedAt = os.clock(),
+		counts = {},
+		timings = {},
+	}
+end
+
+local function finishDestructionProfile(profile: DestructionProfile)
+	local totalMs = (os.clock() - profile.startedAt) * 1000
+	local phaseMs = ms(profile, "broadphaseMs")
+		+ ms(profile, "gridMs")
+		+ ms(profile, "damageMs")
+		+ ms(profile, "debrisMs")
+		+ ms(profile, "connectivityMs")
+		+ ms(profile, "greedyMs")
+		+ ms(profile, "commitMs")
+		+ ms(profile, "supportMs")
+	local schedulerWaitMs = math.max(0, totalMs - phaseMs)
+
+	print(string.format(
+		"[PartBreaker2 timing #%d %s] total=%.2fms phases=%.2fms schedulerWait=%.2fms yields=%d records=%d/%d damaged=%d voxels=%d debris=%d components=%d cuboids=%d",
+		profile.id,
+		profile.kind,
+		totalMs,
+		phaseMs,
+		schedulerWaitMs,
+		count(profile, "budgetYields"),
+		count(profile, "recordsProcessed"),
+		count(profile, "recordsHit"),
+		count(profile, "recordsDamaged"),
+		count(profile, "voxelsRemoved"),
+		count(profile, "debrisPositions"),
+		count(profile, "componentsExtracted"),
+		count(profile, "cuboidsEmitted")
+	))
+
+	print(string.format(
+		"  phases: broadphase=%.2f grid=%.2f damage=%.2f debris=%.2f connectivity=%.2f greedy=%.2f commit=%.2f support=%.2f",
+		ms(profile, "broadphaseMs"),
+		ms(profile, "gridMs"),
+		ms(profile, "damageMs"),
+		ms(profile, "debrisMs"),
+		ms(profile, "connectivityMs"),
+		ms(profile, "greedyMs"),
+		ms(profile, "commitMs"),
+		ms(profile, "supportMs")
+	))
+
+	print(string.format(
+		"  work: lazyGrids=%d partsCreated=%d partsReused=%d partsRetired=%d supportParts=%d supportQueries=%d weldsCreated=%d weldsReused=%d weldsDestroyed=%d unsupportedRoots=%d",
+		count(profile, "lazyGridsCreated"),
+		count(profile, "partsCreated"),
+		count(profile, "partsReused"),
+		count(profile, "partsRetired"),
+		count(profile, "supportIslandParts"),
+		count(profile, "supportQueries"),
+		count(profile, "weldsCreated"),
+		count(profile, "weldsReused"),
+		count(profile, "weldsDestroyed"),
+		count(profile, "unsupportedRoots")
+	))
+
+	print(string.format(
+		"  support graph: workspaceQueries=%d hashCandidates=%d contactTests=%d edgesRebuilt=%d componentsVisited=%d",
+		count(profile, "supportWorkspaceQueries"),
+		count(profile, "supportHashCandidates"),
+		count(profile, "supportContactTests"),
+		count(profile, "supportEdgesRebuilt"),
+		count(profile, "supportComponentsVisited")
+	))
+end
+
+local function anyPlayerWithin(position: Vector3, radius: number): boolean
+	if radius <= 0 then
+		return true
+	end
+
+	local radiusSquared = radius * radius
+	for _, player in Players:GetPlayers() do
+		local character = player.Character
+		if not character then
+			continue
+		end
+		local hrp = character:FindFirstChild("HumanoidRootPart")
+		if hrp and hrp:IsA("BasePart") then
+			local delta = hrp.Position - position
+			if delta:Dot(delta) <= radiusSquared then
+				return true
+			end
+		end
+	end
+
+	return false
 end
 
 local function sampleDebrisPositions(record: Record, removed: { RemovedVoxel }, context: BudgetContext?): { Vector3 }
@@ -288,14 +437,29 @@ local function fireDebris(record: Record, removed: { RemovedVoxel }, impulse: Ve
 		return
 	end
 
+	local lodRadius = runtimeConfig.debrisLodRadius or 0
+	if RunService:IsServer() and lodRadius > 0 and not anyPlayerWithin(record.part.Position, lodRadius) then
+		if context then
+			context.stats.debrisLodSkipped += 1
+		else
+			stats.debrisLodSkipped += 1
+		end
+		return
+	end
+
 	local positions = sampleDebrisPositions(record, removed, context)
 	if #positions <= 0 then
 		return
 	end
 
 	remoteSeed = (remoteSeed + 1) % 2147483647
-	stats.debrisEvents += 1
-	stats.debrisPositions += #positions
+	if context then
+		context.stats.debrisEvents += 1
+		context.stats.debrisPositions += #positions
+	else
+		stats.debrisEvents += 1
+		stats.debrisPositions += #positions
+	end
 
 	local grid = getRecordGrid(record, context)
 	local scaledImpulse = (impulse or Vector3.zero) * record.debrisImpulseMultiplier
@@ -323,8 +487,11 @@ local function fireDebris(record: Record, removed: { RemovedVoxel }, impulse: Ve
 	end
 end
 
-local function retireRecord(record: Record, oldAssemblyParts: { BasePart }, context: BudgetContext?)
-	registry:destroyWeldsTouchingParts(oldAssemblyParts, context)
+local function retireRecord(record: Record, context: BudgetContext?)
+	-- Only tear down welds that actually touch the dying source part. Welds
+	-- between surviving sibling chunks are preserved so SupportGraph's diff
+	-- can claim them for the rebuilt assemblies.
+	registry:destroyWeldsTouchingParts({ record.part }, context)
 	registry:unregisterRecord(record)
 
 	if record.part:GetAttribute("_PartBreaker2GeneratedChunk") == true then
@@ -340,16 +507,20 @@ end
 
 local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetContext)
 	local grid = getRecordGrid(record, context)
-	local oldAssemblyParts = registry:getAssemblyParts(record.assemblyId)
 	local oldCFrame = record.part.CFrame
 	local oldSize = record.part.Size
-	local dirtySeedParts = table.create(#oldAssemblyParts + 8)
-	local dirtySeedSet: { [BasePart]: boolean } = {}
-	appendAssemblyParts(dirtySeedParts, dirtySeedSet, oldAssemblyParts)
-
 	local startedAt = os.clock()
+	registry:rebuildSupportContacts({ record.part }, context)
+	local oldContactNeighbors = registry:getContactNeighbors(record.part)
+	addMs("supportMs", startedAt, context)
+
+	local dirtySeedParts = table.create(#oldContactNeighbors + 8)
+	local dirtySeedSet: { [BasePart]: boolean } = {}
+	appendAssemblyParts(dirtySeedParts, dirtySeedSet, oldContactNeighbors)
+
+	startedAt = os.clock()
 	local components = Connectivity.extractComponents(grid, context)
-	addMs("connectivityMs", startedAt)
+	addMs("connectivityMs", startedAt, context)
 
 	startedAt = os.clock()
 	for componentIndex, component in components do
@@ -359,7 +530,7 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 		component.supported = false
 		component.cuboids = GreedyMesher.meshComponent(grid, component, record.maxCuboids, context)
 	end
-	addMs("greedyMs", startedAt)
+	addMs("greedyMs", startedAt, context)
 
 	local inheritedConfig = getInheritedConfig(record, context)
 	local model = record.model
@@ -368,7 +539,7 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 
 	startedAt = os.clock()
 	local builtAssemblies = builder:buildChunks(record, components, context, inheritedConfig.lazyGeneratedGrid ~= false)
-	retireRecord(record, oldAssemblyParts, context)
+	retireRecord(record, context)
 
 	for _, builtAssembly in builtAssemblies do
 		registry:registerAssembly(
@@ -386,7 +557,7 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 		end
 	end
 	builder:flushBulkMoves()
-	addMs("commitMs", startedAt)
+	addMs("commitMs", startedAt, context)
 
 	startedAt = os.clock()
 	local queryPadding = math.max(2, grid.voxelSize * 2)
@@ -399,7 +570,8 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 		context
 	)
 	builder:flushBulkMoves()
-	addMs("supportMs", startedAt)
+	addMs("supportMs", startedAt, context)
+	addProfileCount(context, "unsupportedRoots", #refreshResult.unsupportedNewRoots)
 
 	applyImpulseToRoots(refreshResult.unsupportedNewRoots, impulse)
 end
@@ -409,24 +581,29 @@ local function processRecordDamage(record: Record, removed: { RemovedVoxel }, im
 		return
 	end
 
+	addProfileCount(context, "recordsDamaged", 1)
+	local startedAt = os.clock()
 	fireDebris(record, removed, impulse, context)
+	addMs("debrisMs", startedAt, context)
 	rebuildRecord(record, impulse, context)
 end
 
 local function processSphere(context: BudgetContext, job: DestroySphereJob)
 	local startedAt = os.clock()
 	local records = registry:querySphere(job.position, job.radius)
-	addMs("broadphaseMs", startedAt)
-	stats.recordsHit += #records
+	addMs("broadphaseMs", startedAt, context)
+	context.stats.recordsHit += #records
 
 	for _, record in records do
 		context:consume("records", 1)
-		stats.recordsProcessed += 1
+		context.stats.recordsProcessed += 1
+		startedAt = os.clock()
 		getRecordGrid(record, context)
+		addMs("gridMs", startedAt, context)
 
 		startedAt = os.clock()
 		local result = DamageSolver.applySphere(record, job.position, job.radius, job.strength, context)
-		addMs("damageMs", startedAt)
+		addMs("damageMs", startedAt, context)
 		processRecordDamage(record, result.removed, job.impulse, context)
 	end
 end
@@ -434,17 +611,19 @@ end
 local function processOBB(context: BudgetContext, job: DestroyOBBJob)
 	local startedAt = os.clock()
 	local records = registry:queryOBB(job.cframe, job.size)
-	addMs("broadphaseMs", startedAt)
-	stats.recordsHit += #records
+	addMs("broadphaseMs", startedAt, context)
+	context.stats.recordsHit += #records
 
 	for _, record in records do
 		context:consume("records", 1)
-		stats.recordsProcessed += 1
+		context.stats.recordsProcessed += 1
+		startedAt = os.clock()
 		getRecordGrid(record, context)
+		addMs("gridMs", startedAt, context)
 
 		startedAt = os.clock()
 		local result = DamageSolver.applyOBB(record, job.cframe, job.size, job.strength, context)
-		addMs("damageMs", startedAt)
+		addMs("damageMs", startedAt, context)
 		processRecordDamage(record, result.removed, job.impulse, context)
 	end
 end
@@ -456,10 +635,18 @@ local function enqueueDestroyJob(job: DestroyJob)
 
 	local name = if job.kind == "sphere" then "destroySphere" else "destroyOBB"
 	scheduler:enqueue(name, function(context: BudgetContext)
+		local profile = if runtimeConfig.logDestructionTimings == true then beginDestructionProfile(job) else nil
+		context:setProfile(profile)
+
 		if job.kind == "sphere" then
 			processSphere(context, job :: DestroySphereJob)
 		else
 			processOBB(context, job :: DestroyOBBJob)
+		end
+
+		if profile then
+			finishDestructionProfile(profile)
+			context:setProfile(nil)
 		end
 	end)
 end
@@ -484,6 +671,14 @@ function PartBreaker2.configureRuntime(config: RuntimeConfig)
 
 	if config.statsReplicationInterval ~= nil then
 		runtimeConfig.statsReplicationInterval = config.statsReplicationInterval
+	end
+
+	if config.debrisLodRadius ~= nil then
+		runtimeConfig.debrisLodRadius = config.debrisLodRadius
+	end
+
+	if config.logDestructionTimings ~= nil then
+		runtimeConfig.logDestructionTimings = config.logDestructionTimings
 	end
 end
 

@@ -36,7 +36,7 @@ type Shard = {
 
 local REMOTE_NAME = "PartBreaker2DebrisEvent"
 local MAX_ACTIVE_SHARDS = 320
-local MAX_SHARDS_PER_EVENT = 96
+local MAX_SHARDS_PER_EVENT = 10
 local GRAVITY = Vector3.new(0, -Workspace.Gravity, 0)
 local BOUNCE_DAMPING = 0.35
 local GROUND_FRICTION = 0.72

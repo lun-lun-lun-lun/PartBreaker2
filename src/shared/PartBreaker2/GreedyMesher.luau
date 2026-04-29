@@ -12,43 +12,6 @@ type BudgetContext = Types.BudgetContext
 
 local DEFAULT_MAX_CUBOIDS = 512
 
-local function componentBounds(grid: VoxelGrid.Grid, component: Component): Cuboid?
-	local firstIndex = component.indices[1]
-	if firstIndex == nil then
-		return nil
-	end
-
-	local firstX, firstY, firstZ = VoxelGrid.indexToCoord(grid, firstIndex)
-	local minX = firstX
-	local minY = firstY
-	local minZ = firstZ
-	local maxX = firstX
-	local maxY = firstY
-	local maxZ = firstZ
-
-	for indexPosition = 2, #component.indices do
-		local x, y, z = VoxelGrid.indexToCoord(grid, component.indices[indexPosition])
-		if x < minX then minX = x end
-		if y < minY then minY = y end
-		if z < minZ then minZ = z end
-		if x > maxX then maxX = x end
-		if y > maxY then maxY = y end
-		if z > maxZ then maxZ = z end
-	end
-
-	local minPoint = VoxelGrid.voxelMin(grid, minX, minY, minZ)
-	local size = Vector3.new(
-		(maxX - minX + 1) * grid.cellSize.X,
-		(maxY - minY + 1) * grid.cellSize.Y,
-		(maxZ - minZ + 1) * grid.cellSize.Z
-	)
-
-	return {
-		center = minPoint + size * 0.5,
-		size = size,
-	}
-end
-
 local function isAvailable(grid: VoxelGrid.Grid, index: number, meshStamp: number, mergedStamp: number): boolean
 	return VoxelGrid.isMeshMarked(grid, index, meshStamp) and not VoxelGrid.isMerged(grid, index, mergedStamp)
 end
@@ -94,9 +57,11 @@ function GreedyMesher.meshComponent(grid: VoxelGrid.Grid, component: Component, 
 		VoxelGrid.markMesh(grid, index, meshStamp)
 	end
 
-	local cuboids = table.create(math.min(#component.indices, cuboidLimit))
+	local cuboids = table.create(math.min(#component.indices, cuboidLimit) + 1)
 	local emitted = 0
 	local overflowed = false
+	local overflowMinX, overflowMinY, overflowMinZ = math.huge, math.huge, math.huge
+	local overflowMaxX, overflowMaxY, overflowMaxZ = -math.huge, -math.huge, -math.huge
 
 	for z = 0, grid.sizeZ - 1 do
 		for y = 0, grid.sizeY - 1 do
@@ -159,18 +124,33 @@ function GreedyMesher.meshComponent(grid: VoxelGrid.Grid, component: Component, 
 					end
 				else
 					overflowed = true
+					local x1 = x + width - 1
+					local y1 = y + height - 1
+					local z1 = z + depth - 1
+					if x < overflowMinX then overflowMinX = x end
+					if y < overflowMinY then overflowMinY = y end
+					if z < overflowMinZ then overflowMinZ = z end
+					if x1 > overflowMaxX then overflowMaxX = x1 end
+					if y1 > overflowMaxY then overflowMaxY = y1 end
+					if z1 > overflowMaxZ then overflowMaxZ = z1 end
 				end
 			end
 		end
 	end
 
 	if overflowed then
-		local fallback = componentBounds(grid, component)
-		if fallback then
-			if context then
-				context.stats.cuboidsEmitted += 1
-			end
-			return { fallback }
+		local minPoint = VoxelGrid.voxelMin(grid, overflowMinX, overflowMinY, overflowMinZ)
+		local size = Vector3.new(
+			(overflowMaxX - overflowMinX + 1) * grid.cellSize.X,
+			(overflowMaxY - overflowMinY + 1) * grid.cellSize.Y,
+			(overflowMaxZ - overflowMinZ + 1) * grid.cellSize.Z
+		)
+		cuboids[#cuboids + 1] = {
+			center = minPoint + size * 0.5,
+			size = size,
+		}
+		if context then
+			context.stats.cuboidsEmitted += 1
 		end
 	end
 

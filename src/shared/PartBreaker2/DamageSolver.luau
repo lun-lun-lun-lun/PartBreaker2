@@ -31,9 +31,13 @@ function DamageSolver.applySphere(record: any, position: Vector3, radius: number
 	local localCenter = record.part.CFrame:PointToObjectSpace(position)
 	local minX, minY, minZ, maxX, maxY, maxZ = ShapeTests.sphereRange(grid, localCenter, radius)
 	local radiusSquared = radius * radius
+	local innerMinX, innerMinY, innerMinZ, innerMaxX, innerMaxY, innerMaxZ =
+		ShapeTests.sphereInteriorRange(grid, localCenter, radius)
 
 	for z = minZ, maxZ do
+		local zInner = z >= innerMinZ and z <= innerMaxZ
 		for y = minY, maxY do
+			local yzInner = zInner and y >= innerMinY and y <= innerMaxY
 			for x = minX, maxX do
 				if context then
 					context:consume("voxelTests", 1)
@@ -45,7 +49,10 @@ function DamageSolver.applySphere(record: any, position: Vector3, radius: number
 					continue
 				end
 
-				if ShapeTests.sphereIntersectsVoxel(grid, localCenter, radiusSquared, x, y, z) and VoxelGrid.markDestroyed(grid, index) then
+				local hit = (yzInner and x >= innerMinX and x <= innerMaxX)
+					or ShapeTests.sphereIntersectsVoxel(grid, localCenter, radiusSquared, x, y, z)
+
+				if hit and VoxelGrid.markDestroyed(grid, index) then
 					appendRemoved(removed, index)
 					if context then
 						context.stats.voxelsRemoved += 1
@@ -81,7 +88,10 @@ function DamageSolver.applyOBB(record: any, cframe: CFrame, size: Vector3, stren
 					continue
 				end
 
-				if ShapeTests.obbIntersectsVoxel(grid, localOBB, size, x, y, z) and VoxelGrid.markDestroyed(grid, index) then
+				local hit = ShapeTests.obbContainsVoxel(grid, localOBB, size, x, y, z)
+					or ShapeTests.obbIntersectsVoxel(grid, localOBB, size, x, y, z)
+
+				if hit and VoxelGrid.markDestroyed(grid, index) then
 					appendRemoved(removed, index)
 					if context then
 						context.stats.voxelsRemoved += 1

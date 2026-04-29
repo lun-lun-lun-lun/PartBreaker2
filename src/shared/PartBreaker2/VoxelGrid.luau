@@ -157,10 +157,16 @@ function VoxelGrid.localAabbToVoxelRange(grid: Grid, minPoint: Vector3, maxPoint
 	return minX, minY, minZ, maxX, maxY, maxZ
 end
 
-local function isInsideWedgeByCenter(localCenter: Vector3, halfSize: Vector3): boolean
-	local normalizedZ = (localCenter.Z + halfSize.Z) / (halfSize.Z * 2)
+-- Conservative wedge test: a voxel cell is solid if any part of it lies under
+-- the wedge's slope. The slope rises with +Z, so the highest allowed Y inside
+-- the cell is at the cell's back edge (localMax.Z); the lowest Y in the cell
+-- (localMin.Y) must be at or below that to intersect.
+local function isInsideWedgeByCorners(localMin: Vector3, localMax: Vector3, halfSize: Vector3): boolean
+	local normalizedZ = (localMax.Z + halfSize.Z) / (halfSize.Z * 2)
+	if normalizedZ < 0 then normalizedZ = 0 end
+	if normalizedZ > 1 then normalizedZ = 1 end
 	local maxY = -halfSize.Y + normalizedZ * (halfSize.Y * 2)
-	return localCenter.Y <= maxY
+	return localMin.Y <= maxY
 end
 
 function VoxelGrid.create(part: BasePart, voxelSize: number, isWedge: boolean): Grid
@@ -203,8 +209,14 @@ function VoxelGrid.create(part: BasePart, voxelSize: number, isWedge: boolean): 
 		for y = 0, sizeY - 1 do
 			for x = 0, sizeX - 1 do
 				local index = VoxelGrid.index(grid, x, y, z)
-				local center = VoxelGrid.voxelCenter(grid, x, y, z)
-				local inside = not isWedge or isInsideWedgeByCenter(center, halfSize)
+				local inside
+				if isWedge then
+					local cellMin = VoxelGrid.voxelMin(grid, x, y, z)
+					local cellMax = cellMin + cellSize
+					inside = isInsideWedgeByCorners(cellMin, cellMax, halfSize)
+				else
+					inside = true
+				end
 				if inside then
 					buffer.writeu8(shapeMask, index, 1)
 					buffer.writeu8(solid, index, 1)

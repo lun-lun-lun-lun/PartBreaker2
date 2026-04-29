@@ -216,22 +216,54 @@ local function chooseRoot(parts: { BasePart }): BasePart?
 	return root
 end
 
-local function weldToRoot(registry: any, assemblyId: number, root: BasePart, parts: { BasePart }, context: any?)
+-- Prefer a part that is already the root of an existing assembly contributing
+-- to this new component — keeping the root stable lets us reuse the existing
+-- WeldConstraints. Tie-break by which old assembly contributes the most parts;
+-- fall back to the largest-volume part if no incumbent root is available.
+local function chooseRootSticky(parts: { BasePart }, registry: any): BasePart?
+	local partSet: { [BasePart]: boolean } = {}
 	for _, part in parts do
-		if part == root then
-			continue
-		end
-
-		if context then
-			context:consume("weldOps", 1)
-			context.stats.weldsCreated += 1
-		end
-		local weld = Instance.new("WeldConstraint")
-		weld.Part0 = root
-		weld.Part1 = part
-		weld.Parent = root
-		registry:registerWeld(assemblyId, weld)
+		partSet[part] = true
 	end
+
+	local oldRootVotes: { [BasePart]: number } = {}
+	for _, part in parts do
+		local oldAssembly = registry:getAssemblyByPart(part)
+		if oldAssembly and oldAssembly.rootPart and partSet[oldAssembly.rootPart] then
+			local rootCandidate = oldAssembly.rootPart
+			oldRootVotes[rootCandidate] = (oldRootVotes[rootCandidate] or 0) + 1
+		end
+	end
+
+	local best = nil :: BasePart?
+	local bestScore = 0
+	for rootCandidate, votes in oldRootVotes do
+		if votes > bestScore then
+			bestScore = votes
+			best = rootCandidate
+		end
+	end
+
+	if best then
+		return best
+	end
+
+	return chooseRoot(parts)
+end
+
+local function planWeldForPart(registry: any, root: BasePart, part: BasePart): WeldConstraint?
+	local oldAssembly = registry:getAssemblyByPart(part)
+	if not oldAssembly then
+		return nil
+	end
+	local existingWeld = oldAssembly.weldByPart[part]
+	if not existingWeld or existingWeld.Parent == nil then
+		return nil
+	end
+	if existingWeld.Part0 == root and existingWeld.Part1 == part then
+		return existingWeld
+	end
+	return nil
 end
 
 local function buildContactGraph(registry: any, islandParts: { BasePart }, context: any?): ({ { number } }, { [number]: boolean })
@@ -333,6 +365,173 @@ local function collectContactComponents(
 	return components
 end
 
+type WeldPlan = {
+	assemblyIndex: number,
+	part: BasePart,
+	existingToClaim: WeldConstraint?,
+}
+
+type NewAssemblyPlan = {
+	component: any,
+	parts: { BasePart },
+	root: BasePart,
+	assemblyId: number,
+	supported: boolean,
+}
+
+local function assemblyWeldsLookValid(assembly: any, root: BasePart, parts: { BasePart }): boolean
+	for _, part in parts do
+		if part == root or not assembly.parts[part] then
+			continue
+		end
+
+		local weld = assembly.weldByPart[part]
+		if not weld or weld.Parent == nil or weld.Part0 ~= root or weld.Part1 ~= part then
+			return false
+		end
+	end
+
+	return true
+end
+
+local function appendActivePart(registry: any, parts: { BasePart }, partSet: { [BasePart]: boolean }, part: BasePart)
+	if partSet[part] or not isActiveVoxelPart(registry, part) then
+		return
+	end
+
+	partSet[part] = true
+	parts[#parts + 1] = part
+end
+
+local function collectDirtyParts(
+	registry: any,
+	seedParts: { BasePart },
+	queryCFrame: CFrame?,
+	querySize: Vector3?,
+	newParts: { BasePart }?,
+	context: any?
+): ({ BasePart }, { [BasePart]: boolean })
+	local dirtyParts = {}
+	local dirtySet: { [BasePart]: boolean } = {}
+	local newPartSet: { [BasePart]: boolean } = {}
+
+	if newParts then
+		for _, part in newParts do
+			newPartSet[part] = true
+			appendActivePart(registry, dirtyParts, dirtySet, part)
+		end
+	end
+
+	for _, seedPart in seedParts do
+		appendActivePart(registry, dirtyParts, dirtySet, seedPart)
+		for _, neighbor in registry:getContactNeighbors(seedPart) do
+			appendActivePart(registry, dirtyParts, dirtySet, neighbor)
+		end
+	end
+
+	if queryCFrame and querySize then
+		for _, nearbyPart in registry:getNearbySupportParts(queryCFrame, querySize, CONTACT_PADDING, context) do
+			appendActivePart(registry, dirtyParts, dirtySet, nearbyPart)
+		end
+	end
+
+	return dirtyParts, newPartSet
+end
+
+local function collectGraphComponents(registry: any, seedParts: { BasePart }, newPartSet: { [BasePart]: boolean }, context: any?)
+	local components = {}
+	local visited: { [BasePart]: boolean } = {}
+
+	for _, startPart in seedParts do
+		if visited[startPart] or not isActiveVoxelPart(registry, startPart) then
+			continue
+		end
+
+		local queue = { startPart }
+		local head = 1
+		local groupParts = {}
+		local supportPartSet: { [BasePart]: boolean } = {}
+		local supported = false
+		local containsNewPart = false
+		local newParts = {}
+		local oldAssemblyCounts: { [any]: number } = {}
+		local oldAssemblyKinds = 0
+		local onlyOldAssembly = nil :: any?
+		visited[startPart] = true
+
+		while head <= #queue do
+			local part = queue[head]
+			head += 1
+			groupParts[#groupParts + 1] = part
+
+			if context then
+				context.stats.supportComponentsVisited += 1
+			end
+
+			registry:ensureSupportContacts(part, context)
+
+			if registry:hasDirectSupport(part) then
+				supported = true
+				supportPartSet[part] = true
+			end
+
+			if newPartSet[part] then
+				containsNewPart = true
+				newParts[#newParts + 1] = part
+			else
+				local assembly = registry:getAssemblyByPart(part)
+				if assembly then
+					if oldAssemblyCounts[assembly] == nil then
+						oldAssemblyKinds += 1
+						onlyOldAssembly = assembly
+						oldAssemblyCounts[assembly] = 0
+					end
+					oldAssemblyCounts[assembly] += 1
+				end
+			end
+
+			local neighbors = registry:getContactNeighborSet(part)
+			if neighbors then
+				for neighbor in neighbors do
+					if not visited[neighbor] and isActiveVoxelPart(registry, neighbor) then
+						visited[neighbor] = true
+						queue[#queue + 1] = neighbor
+					end
+				end
+			end
+		end
+
+		local oldAssembly = if oldAssemblyKinds == 1 then onlyOldAssembly else nil
+		local oldAssemblyPartCount = if oldAssembly then oldAssemblyCounts[oldAssembly] or 0 else 0
+		local unchangedAssembly = nil :: any?
+		local augmentAssembly = nil :: any?
+
+		if oldAssembly and oldAssembly.rootPart and oldAssembly.supported == supported then
+			if #newParts == 0 and oldAssembly.partCount == #groupParts then
+				if assemblyWeldsLookValid(oldAssembly, oldAssembly.rootPart, groupParts) then
+					unchangedAssembly = oldAssembly
+				end
+			elseif #newParts > 0 and oldAssembly.partCount == oldAssemblyPartCount then
+				if assemblyWeldsLookValid(oldAssembly, oldAssembly.rootPart, groupParts) then
+					augmentAssembly = oldAssembly
+				end
+			end
+		end
+
+		components[#components + 1] = {
+			parts = groupParts,
+			supportPartSet = supportPartSet,
+			supported = supported,
+			containsNewPart = containsNewPart,
+			newParts = newParts,
+			unchangedAssembly = unchangedAssembly,
+			augmentAssembly = augmentAssembly,
+		}
+	end
+
+	return components
+end
+
 function SupportGraph.refreshAroundDamage(
 	registry: any,
 	seedParts: { BasePart },
@@ -345,57 +544,238 @@ function SupportGraph.refreshAroundDamage(
 		unsupportedNewRoots = {},
 	}
 
-	local islandParts = collectIslandParts(registry, seedParts, queryCFrame, querySize, context)
-	if #islandParts <= 0 then
+	local dirtyParts, newPartSet = collectDirtyParts(registry, seedParts, queryCFrame, querySize, newParts, context)
+	if #dirtyParts <= 0 then
 		return result
 	end
+
+	registry:rebuildSupportContacts(dirtyParts, context)
+	local components = collectGraphComponents(registry, dirtyParts, newPartSet, context)
 	if context then
-		context.stats.supportIslandParts += #islandParts
+		context.stats.supportIslandParts += #dirtyParts
 	end
 
-	local newPartSet: { [BasePart]: boolean } = {}
-	if newParts then
-		for _, part in newParts do
-			newPartSet[part] = true
+	-- Phase 1: lay out the new assemblies with sticky roots, plan welds.
+	local newAssemblies: { NewAssemblyPlan } = {}
+	local augmentAssemblies = {}
+	local weldPlans: { WeldPlan } = {}
+	local claimedSet: { [WeldConstraint]: boolean } = {}
+	local changedParts = {}
+	local changedPartSet: { [BasePart]: boolean } = {}
+
+	local function markChanged(part: BasePart)
+		if changedPartSet[part] then
+			return
 		end
+		changedPartSet[part] = true
+		changedParts[#changedParts + 1] = part
 	end
-
-	local edges, directSupport = buildContactGraph(registry, islandParts, context)
-	local components = collectContactComponents(islandParts, edges, directSupport, newPartSet)
-
-	registry:destroyWeldsTouchingParts(islandParts, context)
-	registry:clearAssembliesForParts(islandParts)
 
 	for _, component in components do
+		if component.unchangedAssembly then
+			continue
+		end
+
+		if component.augmentAssembly then
+			augmentAssemblies[#augmentAssemblies + 1] = component
+			for _, part in component.newParts do
+				markChanged(part)
+			end
+			continue
+		end
+
 		local parts = component.parts
-		local root = chooseRoot(parts)
+		if #parts <= 0 then
+			continue
+		end
+
+		local root = chooseRootSticky(parts, registry)
 		if not root then
 			continue
 		end
 
-		supportIslandSerial += 1
-		local islandId = supportIslandSerial
 		local assemblyId = registry:allocateAssemblyId()
-		local supported = component.supported == true
-
-		registry:registerAssembly(assemblyId, parts, root, supported)
-		weldToRoot(registry, assemblyId, root, parts, context)
+		local plan: NewAssemblyPlan = {
+			component = component,
+			parts = parts,
+			root = root,
+			assemblyId = assemblyId,
+			supported = component.supported == true,
+		}
+		newAssemblies[#newAssemblies + 1] = plan
+		local assemblyIndex = #newAssemblies
 
 		for _, part in parts do
+			markChanged(part)
+			if part == root then
+				continue
+			end
+
+			local existingToClaim = planWeldForPart(registry, root, part)
+			if existingToClaim then
+				claimedSet[existingToClaim] = true
+			end
+
+			weldPlans[#weldPlans + 1] = {
+				assemblyIndex = assemblyIndex,
+				part = part,
+				existingToClaim = existingToClaim,
+			}
+		end
+	end
+
+	if #changedParts <= 0 then
+		return result
+	end
+
+	-- Snapshot every old assembly touched by changed parts, so we can later
+	-- destroy unclaimed welds without touching unchanged graph components.
+	local affectedAssemblies: { [number]: any } = {}
+	for _, part in changedParts do
+		local oldAssembly = registry:getAssemblyByPart(part)
+		if oldAssembly then
+			affectedAssemblies[oldAssembly.id] = oldAssembly
+		end
+	end
+
+	-- Phase 2: destroy welds that weren't claimed (touching changed parts).
+	for _, oldAssembly in affectedAssemblies do
+		local snapshot = {}
+		for weld in oldAssembly.welds do
+			snapshot[#snapshot + 1] = weld
+		end
+		for _, weld in snapshot do
+			if claimedSet[weld] then
+				continue
+			end
+			local touchesChanged = (weld.Part0 and changedPartSet[weld.Part0])
+				or (weld.Part1 and changedPartSet[weld.Part1])
+			if touchesChanged then
+				if context then
+					context:consume("weldOps", 1)
+					context.stats.weldsDestroyed += 1
+				end
+				weld:Destroy()
+			end
+		end
+	end
+
+	-- Sweep any stray (untracked) WeldConstraints parented under changed parts.
+	for _, part in changedParts do
+		for _, child in part:GetChildren() do
+			if child:IsA("WeldConstraint") and not claimedSet[child] and child.Parent ~= nil then
+				if context then
+					context:consume("weldOps", 1)
+					context.stats.weldsDestroyed += 1
+				end
+				child:Destroy()
+			end
+		end
+	end
+
+	-- Phase 3: detach claimed welds from old bookkeeping so we can re-register.
+	for weld in claimedSet do
+		for _, oldAssembly in affectedAssemblies do
+			if oldAssembly.welds[weld] then
+				registry:detachWeldFromAssembly(oldAssembly, weld)
+			end
+		end
+	end
+
+	-- Phase 4: clear assembly memberships for island parts; register the new
+	-- assemblies and re-attach claimed welds + create the new ones.
+	registry:clearAssembliesForParts(changedParts)
+
+	for _, component in augmentAssemblies do
+		local assembly = component.augmentAssembly
+		local root = assembly.rootPart
+		if not root then
+			continue
+		end
+
+		registry:registerAssembly(assembly.id, component.newParts, root, component.supported)
+		for _, part in component.newParts do
+			if part ~= root then
+				if context then
+					context:consume("weldOps", 1)
+					context.stats.weldsCreated += 1
+				end
+				local weld = Instance.new("WeldConstraint")
+				weld.Part0 = root
+				weld.Part1 = part
+				weld.Parent = root
+				registry:registerWeld(assembly.id, weld)
+			end
+		end
+	end
+
+	for _, plan in newAssemblies do
+		registry:registerAssembly(plan.assemblyId, plan.parts, plan.root, plan.supported)
+	end
+
+	for _, weldPlan in weldPlans do
+		local plan = newAssemblies[weldPlan.assemblyIndex]
+		local assemblyId = plan.assemblyId
+		if weldPlan.existingToClaim then
+			registry:registerWeld(assemblyId, weldPlan.existingToClaim)
+			if context then
+				context.stats.weldsReused += 1
+			end
+		else
+			if context then
+				context:consume("weldOps", 1)
+				context.stats.weldsCreated += 1
+			end
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0 = plan.root
+			weld.Part1 = weldPlan.part
+			weld.Parent = plan.root
+			registry:registerWeld(assemblyId, weld)
+		end
+	end
+
+	-- Phase 5: per-part attributes & anchoring; collect unsupported new roots.
+	for _, component in augmentAssemblies do
+		local assembly = component.augmentAssembly
+		supportIslandSerial += 1
+		local islandId = supportIslandSerial
+		for _, part in component.newParts do
 			local supportReason = "Unsupported"
-			if supported then
+			if component.supported then
 				supportReason = if component.supportPartSet[part] then "ExternalAnchor" else "ConnectedToSupport"
 			end
 
+			part.Anchored = component.supported
+			part:SetAttribute("PartBreaker2AssemblyId", assembly.id)
+			part:SetAttribute("PartBreaker2Supported", component.supported)
+			part:SetAttribute("PartBreaker2SupportReason", supportReason)
+			part:SetAttribute("PartBreaker2ContactIslandId", islandId)
+		end
+
+		if not component.supported and component.containsNewPart and assembly.rootPart then
+			result.unsupportedNewRoots[#result.unsupportedNewRoots + 1] = assembly.rootPart
+		end
+	end
+
+	for _, plan in newAssemblies do
+		supportIslandSerial += 1
+		local islandId = supportIslandSerial
+		local supported = plan.supported
+		for _, part in plan.parts do
+			local supportReason = "Unsupported"
+			if supported then
+				supportReason = if plan.component.supportPartSet[part] then "ExternalAnchor" else "ConnectedToSupport"
+			end
+
 			part.Anchored = supported
-			part:SetAttribute("PartBreaker2AssemblyId", assemblyId)
+			part:SetAttribute("PartBreaker2AssemblyId", plan.assemblyId)
 			part:SetAttribute("PartBreaker2Supported", supported)
 			part:SetAttribute("PartBreaker2SupportReason", supportReason)
 			part:SetAttribute("PartBreaker2ContactIslandId", islandId)
 		end
 
-		if not supported and component.containsNewPart then
-			result.unsupportedNewRoots[#result.unsupportedNewRoots + 1] = root
+		if not supported and plan.component.containsNewPart then
+			result.unsupportedNewRoots[#result.unsupportedNewRoots + 1] = plan.root
 		end
 	end
 

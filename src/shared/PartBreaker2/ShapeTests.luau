@@ -41,6 +41,41 @@ function ShapeTests.sphereIntersectsVoxel(grid: VoxelGrid.Grid, localCenter: Vec
 	return dx * dx + dy * dy + dz * dz <= radiusSquared
 end
 
+-- Returns the voxel index range whose centers are guaranteed to lie strictly
+-- inside the sphere (so the voxel cell is fully contained). Returns an empty
+-- range (lo > hi on each axis) if the sphere has no such interior.
+function ShapeTests.sphereInteriorRange(grid: VoxelGrid.Grid, localCenter: Vector3, radius: number): (number, number, number, number, number, number)
+	local cellSize = grid.cellSize
+	local halfSize = grid.halfSize
+	local halfDiag = cellSize.Magnitude * 0.5
+	local innerR = radius - halfDiag
+	if innerR <= 0 then
+		return 1, 0, 1, 0, 1, 0
+	end
+
+	local extent = innerR / math.sqrt(3)
+
+	local minX = math.ceil((localCenter.X - extent + halfSize.X - cellSize.X * 0.5) / cellSize.X)
+	local maxX = math.floor((localCenter.X + extent + halfSize.X - cellSize.X * 0.5) / cellSize.X)
+	local minY = math.ceil((localCenter.Y - extent + halfSize.Y - cellSize.Y * 0.5) / cellSize.Y)
+	local maxY = math.floor((localCenter.Y + extent + halfSize.Y - cellSize.Y * 0.5) / cellSize.Y)
+	local minZ = math.ceil((localCenter.Z - extent + halfSize.Z - cellSize.Z * 0.5) / cellSize.Z)
+	local maxZ = math.floor((localCenter.Z + extent + halfSize.Z - cellSize.Z * 0.5) / cellSize.Z)
+
+	if minX < 0 then minX = 0 end
+	if minY < 0 then minY = 0 end
+	if minZ < 0 then minZ = 0 end
+	if maxX > grid.sizeX - 1 then maxX = grid.sizeX - 1 end
+	if maxY > grid.sizeY - 1 then maxY = grid.sizeY - 1 end
+	if maxZ > grid.sizeZ - 1 then maxZ = grid.sizeZ - 1 end
+
+	if minX > maxX or minY > maxY or minZ > maxZ then
+		return 1, 0, 1, 0, 1, 0
+	end
+
+	return minX, minY, minZ, maxX, maxY, maxZ
+end
+
 function ShapeTests.obbRange(grid: VoxelGrid.Grid, localOBB: CFrame, size: Vector3): (number, number, number, number, number, number)
 	local half = size * 0.5
 	local minX = math.huge
@@ -92,6 +127,28 @@ local function axisSeparates(axis: Vector3, centerDelta: Vector3, aHalf: Vector3
 	local distance = abs(centerDelta:Dot(axis))
 	local radius = projectAabbRadius(axis, aHalf) + projectObbRadius(axis, bx, by, bz, bHalf)
 	return distance > radius + EPSILON
+end
+
+-- Cheap fast-path containment check: returns true iff the entire voxel cell
+-- lies inside the OBB. Costs 3 dot products + 3 axis projections (vs. 15-axis
+-- SAT for obbIntersectsVoxel). Use as a guard before the full intersect test.
+function ShapeTests.obbContainsVoxel(grid: VoxelGrid.Grid, localOBB: CFrame, size: Vector3, x: number, y: number, z: number): boolean
+	local voxelCenter = VoxelGrid.voxelCenter(grid, x, y, z)
+	local obbHalf = size * 0.5
+	local cellHalf = grid.cellSize * 0.5
+	local delta = voxelCenter - localOBB.Position
+	local bx = localOBB.RightVector
+	local by = localOBB.UpVector
+	local bz = localOBB.LookVector
+
+	local projX = abs(delta:Dot(bx)) + cellHalf.X * abs(bx.X) + cellHalf.Y * abs(bx.Y) + cellHalf.Z * abs(bx.Z)
+	if projX > obbHalf.X then return false end
+	local projY = abs(delta:Dot(by)) + cellHalf.X * abs(by.X) + cellHalf.Y * abs(by.Y) + cellHalf.Z * abs(by.Z)
+	if projY > obbHalf.Y then return false end
+	local projZ = abs(delta:Dot(bz)) + cellHalf.X * abs(bz.X) + cellHalf.Y * abs(bz.Y) + cellHalf.Z * abs(bz.Z)
+	if projZ > obbHalf.Z then return false end
+
+	return true
 end
 
 function ShapeTests.obbIntersectsVoxel(grid: VoxelGrid.Grid, localOBB: CFrame, size: Vector3, x: number, y: number, z: number): boolean

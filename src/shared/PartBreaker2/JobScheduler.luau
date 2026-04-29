@@ -16,6 +16,7 @@ type BudgetContext = Types.BudgetContext
 type WorkItem = {
 	thread: thread,
 	name: string,
+	context: BudgetContext,
 }
 
 export type Scheduler = typeof(setmetatable(
@@ -27,7 +28,6 @@ export type Scheduler = typeof(setmetatable(
 		remaining: { [string]: number },
 		stats: RuntimeStats,
 		connection: RBXScriptConnection?,
-		context: BudgetContext,
 	},
 	JobScheduler
 ))
@@ -67,6 +67,40 @@ end
 local function makeContext(self: Scheduler): BudgetContext
 	local context = {} :: any
 	local scheduler = self
+	local statsProxy = nil :: any?
+
+	local function addProfileCount(key: string, delta: number)
+		local profile = context.profile
+		if not profile or delta == 0 then
+			return
+		end
+
+		local counts = profile.counts
+		counts[key] = (counts[key] or 0) + delta
+	end
+
+	local function getStatsProxy()
+		if statsProxy then
+			return statsProxy
+		end
+
+		statsProxy = setmetatable({}, {
+			__index = function(_, key)
+				return (scheduler.stats :: any)[key]
+			end,
+			__newindex = function(_, key, value)
+				local statsTable = scheduler.stats :: any
+				local oldValue = statsTable[key]
+				statsTable[key] = value
+
+				if typeof(key) == "string" and typeof(oldValue) == "number" and typeof(value) == "number" then
+					addProfileCount(key, value - oldValue)
+				end
+			end,
+		})
+
+		return statsProxy
+	end
 
 	function context.consume(_context: BudgetContext, key: BudgetKey, amount: number?)
 		local budgetKey = key :: string
@@ -86,12 +120,18 @@ local function makeContext(self: Scheduler): BudgetContext
 				return
 			end
 
-			scheduler.stats.budgetYields += 1
+			context.stats.budgetYields += 1
 			coroutine.yield()
 		end
 	end
 
+	function context.setProfile(_context: BudgetContext, profile: any?)
+		context.profile = profile
+		context.stats = if profile then getStatsProxy() else scheduler.stats
+	end
+
 	context.stats = scheduler.stats
+	context.profile = nil
 	return context :: BudgetContext
 end
 
@@ -110,10 +150,8 @@ function JobScheduler.new(stats: RuntimeStats, budgets: RuntimeBudgets?): Schedu
 		remaining = {},
 		stats = stats,
 		connection = nil,
-		context = nil :: any,
 	}, JobScheduler) :: Scheduler
 
-	self.context = makeContext(self)
 	self.connection = RunService.Heartbeat:Connect(function()
 		self:step()
 	end)
@@ -129,6 +167,7 @@ function JobScheduler.enqueue(self: Scheduler, name: string, work: (BudgetContex
 	self.queue[#self.queue + 1] = {
 		name = name,
 		thread = coroutine.create(work),
+		context = makeContext(self),
 	}
 	self.stats.jobsQueued += 1
 	self.stats.queueLength = self:pendingCount()
@@ -153,7 +192,7 @@ function JobScheduler.step(self: Scheduler)
 		self.remaining["tasks"] -= 1
 
 		local item = self.queue[self.head]
-		local success, err = coroutine.resume(item.thread, self.context)
+		local success, err = coroutine.resume(item.thread, item.context)
 		if not success then
 			warn(`PartBreaker2 job "{item.name}" failed: {err}`)
 			self.head += 1
