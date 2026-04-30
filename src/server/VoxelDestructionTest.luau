@@ -1,6 +1,6 @@
 --!strict
 
-local CollectionService = game:GetService("CollectionService")
+-- local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local StarterPack = game:GetService("StarterPack")
@@ -8,9 +8,6 @@ local Workspace = game:GetService("Workspace")
 
 local VoxelDestructionTest = {}
 
-local TEST_MODEL_NAME = "PartBreaker2RandomVoxelTest"
-local SUPPORT_TEST_MODEL_NAME = "PartBreaker2SupportRefreshTest"
-local SUPPORT_TEST_BASE_NAME = "PartBreaker2SupportRefreshBase"
 local SPHERE_TOOL_NAME = "Voxel Breaker"
 local SLICE_TOOL_NAME = "Voxel Support Slice"
 local GREEDY_VIS_TOOL_NAME = "Viz Greedy Meshes"
@@ -26,8 +23,6 @@ local MAX_DESTROY_DISTANCE = 140
 local DESTROY_STRENGTH = 250
 local DESTROY_IMPULSE = 70
 local TOOL_COOLDOWN = 0.25
-local PART_COUNT = 32
-local RANDOM_SEED = 424242
 
 local lastUseByPlayer: { [Player]: number } = {}
 local toolRemote = nil :: RemoteEvent?
@@ -55,144 +50,8 @@ local function getNetworkServer(): any?
 	return networkServer
 end
 
-local function randomRange(random: Random, minValue: number, maxValue: number): number
-	return minValue + (maxValue - minValue) * random:NextNumber()
-end
 
-local function randomCFrame(random: Random, position: Vector3): CFrame
-	return CFrame.new(position)
-		* CFrame.Angles(
-			math.rad(random:NextNumber(-35, 35)),
-			math.rad(random:NextNumber(0, 360)),
-			math.rad(random:NextNumber(-35, 35))
-		)
-end
 
-local function configureVoxelPart(part: BasePart, random: Random)
-	part.Anchored = true
-	part.CanCollide = true
-	part.CanQuery = true
-	part.CanTouch = true
-	part.Material = Enum.Material.Concrete
-	part.Color = Color3.fromHSV(random:NextNumber(0.02, 0.13), random:NextNumber(0.35, 0.7), random:NextNumber(0.55, 0.9))
-	part.TopSurface = Enum.SurfaceType.Smooth
-	part.BottomSurface = Enum.SurfaceType.Smooth
-	part:SetAttribute("VoxelPart", true)
-	part:SetAttribute("VoxelSize", random:NextNumber(1.25, 2.25))
-	part:SetAttribute("RequiredStrength", random:NextInteger(0, 90))
-	part:SetAttribute("MaxCuboids", 320)
-	part:SetAttribute("MaxDebrisVoxels", 20)
-	part:SetAttribute("DebrisLifetime", 2.75)
-	part:SetAttribute("DebrisImpulseMultiplier", 1)
-	part:SetAttribute("VoxelSupport", "Bottom")
-end
-
-local function makeRandomVoxelPart(random: Random, parent: Instance, index: number)
-	local useWedge = random:NextNumber() < 0.28
-	local part: BasePart = if useWedge then Instance.new("WedgePart") else Instance.new("Part")
-	part.Name = if useWedge then `VoxelWedge_{index}` else `VoxelBlock_{index}`
-	part.Size = Vector3.new(
-		randomRange(random, 5, 13),
-		randomRange(random, 4, 12),
-		randomRange(random, 5, 13)
-	)
-
-	local column = (index - 1) % 8
-	local row = math.floor((index - 1) / 8)
-	local layer = math.floor((index - 1) / 16)
-	local basePosition = Vector3.new(
-		(column - 3.5) * 8 + randomRange(random, -1.8, 1.8),
-		3.5 + layer * 8 + randomRange(random, -0.8, 2.2),
-		-42 - row * 8 + randomRange(random, -1.8, 1.8)
-	)
-
-	part.CFrame = randomCFrame(random, basePosition)
-	configureVoxelPart(part, random)
-	part.Parent = parent
-end
-
-function VoxelDestructionTest.createRandomVoxelModel(partBreaker: any): Model
-	local existing = Workspace:FindFirstChild(TEST_MODEL_NAME)
-	if existing then
-		existing:Destroy()
-	end
-
-	local random = Random.new(RANDOM_SEED)
-	local model = Instance.new("Model")
-	model.Name = TEST_MODEL_NAME
-	model:SetAttribute("VoxelModel", true)
-
-	for index = 1, PART_COUNT do
-		makeRandomVoxelPart(random, model, index)
-	end
-
-	model.Parent = Workspace
-	CollectionService:AddTag(model, "VoxelModel")
-	partBreaker.registerModel(model)
-
-	print(`[PartBreaker2 test] spawned {PART_COUNT} randomized VoxelParts in {model:GetFullName()}`)
-	return model
-end
-
-function VoxelDestructionTest.createSupportRefreshTestModel(partBreaker: any): Model
-	local existingModel = Workspace:FindFirstChild(SUPPORT_TEST_MODEL_NAME)
-	if existingModel then
-		existingModel:Destroy()
-	end
-
-	local existingBase = Workspace:FindFirstChild(SUPPORT_TEST_BASE_NAME)
-	if existingBase then
-		existingBase:Destroy()
-	end
-
-	local base = Instance.new("Part")
-	base.Name = SUPPORT_TEST_BASE_NAME
-	base.Size = Vector3.new(72, 1, 18)
-	base.CFrame = CFrame.new(0, -0.5, 28)
-	base.Anchored = true
-	base.CanCollide = true
-	base.CanQuery = true
-	base.CanTouch = true
-	base.Material = Enum.Material.Concrete
-	base.Color = Color3.fromRGB(105, 112, 120)
-	base.TopSurface = Enum.SurfaceType.Smooth
-	base.BottomSurface = Enum.SurfaceType.Smooth
-	base:SetAttribute("PartBreaker2SupportAnchor", true)
-	base.Parent = Workspace
-
-	local model = Instance.new("Model")
-	model.Name = SUPPORT_TEST_MODEL_NAME
-	model:SetAttribute("VoxelModel", true)
-
-	local wall = Instance.new("Part")
-	wall.Name = "SupportRefreshWall"
-	wall.Size = Vector3.new(56, 32, 4)
-	wall.CFrame = CFrame.new(0, 16, 28)
-	wall.Anchored = true
-	wall.CanCollide = true
-	wall.CanQuery = true
-	wall.CanTouch = true
-	wall.Material = Enum.Material.Concrete
-	wall.Color = Color3.fromRGB(155, 164, 176)
-	wall.TopSurface = Enum.SurfaceType.Smooth
-	wall.BottomSurface = Enum.SurfaceType.Smooth
-	wall:SetAttribute("VoxelPart", true)
-	wall:SetAttribute("VoxelSize", 2)
-	wall:SetAttribute("RequiredStrength", 0)
-	wall:SetAttribute("MaxCuboids", 512)
-	wall:SetAttribute("MaxDebrisVoxels", 20)
-	wall:SetAttribute("DebrisLifetime", 2.5)
-	wall:SetAttribute("DebrisImpulseMultiplier", 1)
-	wall:SetAttribute("VoxelSupport", "Graph")
-	wall.Parent = model
-
-	model.Parent = Workspace
-	CollectionService:AddTag(model, "VoxelModel")
-	partBreaker.registerModel(model)
-
-	print("[PartBreaker2 support test] spawned wall. Use Voxel Support Slice across the wall: bottom should stay supported, top should fall.")
-	return model
-end
 
 local function createDestroyerPreview(center: Vector3)
 	local preview = Instance.new("Part")
@@ -404,8 +263,6 @@ local function useToolAtMouse(partBreaker: any, player: Player, targetPosition: 
 end
 
 function VoxelDestructionTest.start(partBreaker: any)
-	VoxelDestructionTest.createRandomVoxelModel(partBreaker)
-	VoxelDestructionTest.createSupportRefreshTestModel(partBreaker)
 	ensureStarterTool(SPHERE_TOOL_NAME, SPHERE_MODE, "Click to spawn a PartBreaker2 sphere destroyer at your mouse")
 	ensureStarterTool(SLICE_TOOL_NAME, SLICE_MODE, "Click the support-test wall to cut it with a horizontal OBB slice")
 	ensureStarterVisualizerTool(GREEDY_VIS_TOOL_NAME, GREEDY_VIS_MODE, "Click to toggle greedy mesh coloring")
