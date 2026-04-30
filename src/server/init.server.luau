@@ -74,8 +74,11 @@ PartBreaker2.registerAttributedModels(Workspace)
 
 CollectionService:GetInstanceAddedSignal("VoxelModel"):Connect(registerVoxelModel)
 Workspace.DescendantAdded:Connect(function(instance)
-	if instance:IsA("Model") and instance:GetAttribute("VoxelModel") == true then
-		PartBreaker2.registerModel(instance)
+	if instance:IsA("Model") then
+		local model = (instance :: any) :: Model
+		if model:GetAttribute("VoxelModel") == true then
+			PartBreaker2.registerModel(model)
+		end
 	end
 end)
 

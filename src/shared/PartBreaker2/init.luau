@@ -155,8 +155,8 @@ local function fireDebugStats()
 		return
 	end
 
-	local snapshot = PartBreaker2.getStats()
-	server.DebugStats.FireAll({
+	local snapshot = (PartBreaker2 :: any).getStats() :: RuntimeStats
+	;(server.DebugStats :: any).FireAll({
 		QueueLength = math.min(65535, snapshot.queueLength),
 		JobsQueued = math.min(4294967295, snapshot.jobsQueued),
 		JobsCompleted = math.min(4294967295, snapshot.jobsCompleted),
@@ -381,7 +381,7 @@ end
 local function sampleDebrisPositions(record: Record, removed: { RemovedVoxel }, context: BudgetContext?): { Vector3 }
 	local grid = getRecordGrid(record, context)
 	local limit = math.min(record.maxDebrisVoxels, #removed)
-	local positions = table.create(limit)
+	local positions = table.create(limit) :: { Vector3 }
 	if limit <= 0 then
 		return positions
 	end
@@ -465,7 +465,7 @@ local function fireDebris(record: Record, removed: { RemovedVoxel }, impulse: Ve
 	local scaledImpulse = (impulse or Vector3.zero) * record.debrisImpulseMultiplier
 	local server = getNetworkServer()
 	if server and server.Debris then
-		server.Debris.FireAll({
+		(server.Debris :: any).FireAll({
 			Seed = remoteSeed,
 			Positions = positions,
 			CellSize = grid.cellSize,
@@ -510,11 +510,11 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 	local oldCFrame = record.part.CFrame
 	local oldSize = record.part.Size
 	local startedAt = os.clock()
-	registry:rebuildSupportContacts({ record.part }, context)
+	registry:ensureSupportContacts(record.part, context)
 	local oldContactNeighbors = registry:getContactNeighbors(record.part)
 	addMs("supportMs", startedAt, context)
 
-	local dirtySeedParts = table.create(#oldContactNeighbors + 8)
+	local dirtySeedParts = table.create(#oldContactNeighbors + 8) :: { BasePart }
 	local dirtySeedSet: { [BasePart]: boolean } = {}
 	appendAssemblyParts(dirtySeedParts, dirtySeedSet, oldContactNeighbors)
 
@@ -534,7 +534,7 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 
 	local inheritedConfig = getInheritedConfig(record, context)
 	local model = record.model
-	local newParts = table.create(16)
+	local newParts = table.create(16) :: { BasePart }
 	local newPartSet: { [BasePart]: boolean } = {}
 
 	startedAt = os.clock()
@@ -688,7 +688,7 @@ function PartBreaker2.getStats(): RuntimeStats
 	end
 
 	local copy = {} :: any
-	for key, value in stats do
+	for key, value in stats :: any do
 		copy[key] = value
 	end
 	return copy :: RuntimeStats

@@ -12,6 +12,7 @@ type RuntimeBudgets = Types.RuntimeBudgets
 type RuntimeStats = Types.RuntimeStats
 type BudgetKey = Types.BudgetKey
 type BudgetContext = Types.BudgetContext
+type BudgetMap = { [string]: number }
 
 type WorkItem = {
 	thread: thread,
@@ -24,15 +25,15 @@ export type Scheduler = typeof(setmetatable(
 		queue: { WorkItem },
 		head: number,
 		processing: boolean,
-		budgets: { [string]: number },
-		remaining: { [string]: number },
+		budgets: BudgetMap,
+		remaining: BudgetMap,
 		stats: RuntimeStats,
 		connection: RBXScriptConnection?,
 	},
 	JobScheduler
 ))
 
-local DEFAULT_BUDGETS = {
+local DEFAULT_BUDGETS: BudgetMap = {
 	tasks = 4,
 	records = 3,
 	voxelTests = 6000,
@@ -54,8 +55,8 @@ local BUDGET_FIELDS: { [string]: string } = {
 	weldOps = "maxWeldOpsPerFrame",
 }
 
-local function normalizeBudgets(config: RuntimeBudgets?): { [string]: number }
-	local budgets = {}
+local function normalizeBudgets(config: RuntimeBudgets?): BudgetMap
+	local budgets = {} :: BudgetMap
 	for key, defaultValue in DEFAULT_BUDGETS do
 		local field = BUDGET_FIELDS[key]
 		local configured = if config then (config :: any)[field] else nil
@@ -103,7 +104,7 @@ local function makeContext(self: Scheduler): BudgetContext
 	end
 
 	function context.consume(_context: BudgetContext, key: BudgetKey, amount: number?)
-		local budgetKey = key :: string
+		local budgetKey = key
 		local requested = amount or 1
 		if requested <= 0 then
 			return
@@ -143,11 +144,11 @@ end
 
 function JobScheduler.new(stats: RuntimeStats, budgets: RuntimeBudgets?): Scheduler
 	local self = setmetatable({
-		queue = {},
+		queue = {} :: { WorkItem },
 		head = 1,
 		processing = false,
 		budgets = normalizeBudgets(budgets),
-		remaining = {},
+		remaining = {} :: BudgetMap,
 		stats = stats,
 		connection = nil,
 	}, JobScheduler) :: Scheduler

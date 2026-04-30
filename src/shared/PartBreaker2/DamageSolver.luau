@@ -23,7 +23,7 @@ end
 
 function DamageSolver.applySphere(record: any, position: Vector3, radius: number, strength: number, context: BudgetContext?): DamageResult
 	local grid: VoxelGrid.Grid = record.grid
-	local removed = table.create(64)
+	local removed = table.create(64) :: { RemovedVoxel }
 	if strength < record.requiredStrength or grid.solidCount <= 0 then
 		return { removed = removed }
 	end
@@ -67,7 +67,7 @@ end
 
 function DamageSolver.applyOBB(record: any, cframe: CFrame, size: Vector3, strength: number, context: BudgetContext?): DamageResult
 	local grid: VoxelGrid.Grid = record.grid
-	local removed = table.create(64)
+	local removed = table.create(64) :: { RemovedVoxel }
 	if strength < record.requiredStrength or grid.solidCount <= 0 then
 		return { removed = removed }
 	end

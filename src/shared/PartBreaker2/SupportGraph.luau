@@ -1,7 +1,7 @@
 --!strict
 --!native
 
-local Workspace = game:GetService("Workspace")
+local ShapeTests = require(script.Parent.ShapeTests)
 
 local SupportGraph = {}
 
@@ -13,192 +13,23 @@ export type RefreshResult = {
 	unsupportedNewRoots: { BasePart },
 }
 
-local function abs(value: number): number
-	return if value < 0 then -value else value
-end
+type GraphComponent = {
+	parts: { BasePart },
+	supportPartSet: { [BasePart]: boolean },
+	supported: boolean,
+	containsNewPart: boolean,
+	newParts: { BasePart },
+	unchangedAssembly: any?,
+	augmentAssembly: any?,
+}
 
 local function partVolume(part: BasePart): number
 	local size = part.Size
 	return size.X * size.Y * size.Z
 end
 
-local function obbTouches(cframeA: CFrame, sizeA: Vector3, cframeB: CFrame, sizeB: Vector3, padding: number): boolean
-	local aHalf = sizeA * 0.5 + Vector3.new(padding, padding, padding)
-	local bHalf = sizeB * 0.5 + Vector3.new(padding, padding, padding)
-	local aAxes = {
-		cframeA.RightVector,
-		cframeA.UpVector,
-		cframeA.LookVector,
-	}
-	local bAxes = {
-		cframeB.RightVector,
-		cframeB.UpVector,
-		cframeB.LookVector,
-	}
-	local centerDelta = cframeB.Position - cframeA.Position
-	local epsilon = 1e-6
-
-	for _, axis in aAxes do
-		local distance = abs(centerDelta:Dot(axis))
-		local radiusA = if axis == aAxes[1] then aHalf.X elseif axis == aAxes[2] then aHalf.Y else aHalf.Z
-		local radiusB = bHalf.X * abs(axis:Dot(bAxes[1]))
-			+ bHalf.Y * abs(axis:Dot(bAxes[2]))
-			+ bHalf.Z * abs(axis:Dot(bAxes[3]))
-		if distance > radiusA + radiusB + epsilon then
-			return false
-		end
-	end
-
-	for _, axis in bAxes do
-		local distance = abs(centerDelta:Dot(axis))
-		local radiusA = aHalf.X * abs(axis:Dot(aAxes[1]))
-			+ aHalf.Y * abs(axis:Dot(aAxes[2]))
-			+ aHalf.Z * abs(axis:Dot(aAxes[3]))
-		local radiusB = if axis == bAxes[1] then bHalf.X elseif axis == bAxes[2] then bHalf.Y else bHalf.Z
-		if distance > radiusA + radiusB + epsilon then
-			return false
-		end
-	end
-
-	for _, axisA in aAxes do
-		for _, axisB in bAxes do
-			local axis = axisA:Cross(axisB)
-			if axis:Dot(axis) <= epsilon then
-				continue
-			end
-
-			local distance = abs(centerDelta:Dot(axis))
-			local radiusA = aHalf.X * abs(axis:Dot(aAxes[1]))
-				+ aHalf.Y * abs(axis:Dot(aAxes[2]))
-				+ aHalf.Z * abs(axis:Dot(aAxes[3]))
-			local radiusB = bHalf.X * abs(axis:Dot(bAxes[1]))
-				+ bHalf.Y * abs(axis:Dot(bAxes[2]))
-				+ bHalf.Z * abs(axis:Dot(bAxes[3]))
-			if distance > radiusA + radiusB + epsilon then
-				return false
-			end
-		end
-	end
-
-	return true
-end
-
-local function expandedSize(part: BasePart): Vector3
-	return part.Size + Vector3.new(CONTACT_PADDING * 2, CONTACT_PADDING * 2, CONTACT_PADDING * 2)
-end
-
 local function isActiveVoxelPart(registry: any, part: BasePart): boolean
 	return registry:isActiveVoxelPart(part)
-end
-
-local function isExplicitSupportAnchor(part: BasePart): boolean
-	return part:GetAttribute("PartBreaker2SupportAnchor") == true
-end
-
-local function isExternalSupport(registry: any, part: BasePart): boolean
-	if part.Parent == nil then
-		return false
-	end
-
-	if isExplicitSupportAnchor(part) then
-		return true
-	end
-
-	if isActiveVoxelPart(registry, part) or part:GetAttribute("VoxelPart") == true then
-		return false
-	end
-
-	return part.Anchored
-end
-
-local function addUniquePart(parts: { BasePart }, partSet: { [BasePart]: boolean }, part: BasePart)
-	if partSet[part] then
-		return
-	end
-
-	partSet[part] = true
-	parts[#parts + 1] = part
-end
-
-local function addEdge(edges: { { number } }, a: number, b: number)
-	if a == b then
-		return
-	end
-
-	edges[a][#edges[a] + 1] = b
-	edges[b][#edges[b] + 1] = a
-end
-
-local function collectIslandParts(
-	registry: any,
-	seedParts: { BasePart },
-	queryCFrame: CFrame?,
-	querySize: Vector3?,
-	context: any?
-): { BasePart }
-	local overlapParams = OverlapParams.new()
-	overlapParams.MaxParts = 0
-	overlapParams.RespectCanCollide = false
-
-	local islandParts = {}
-	local islandSet: { [BasePart]: boolean } = {}
-	local queue = {}
-	local queued: { [BasePart]: boolean } = {}
-	local head = 1
-
-	local function enqueue(part: BasePart)
-		if queued[part] or not isActiveVoxelPart(registry, part) then
-			return
-		end
-
-		queued[part] = true
-		queue[#queue + 1] = part
-		addUniquePart(islandParts, islandSet, part)
-	end
-
-	for _, seedPart in seedParts do
-		enqueue(seedPart)
-	end
-
-	if queryCFrame and querySize then
-		if context then
-			context:consume("supportQueries", 1)
-			context.stats.supportQueries += 1
-		end
-		for _, nearbyPart in Workspace:GetPartBoundsInBox(queryCFrame, querySize, overlapParams) do
-			if nearbyPart:IsA("BasePart") then
-				enqueue(nearbyPart)
-			end
-		end
-	end
-
-	while head <= #queue do
-		local part = queue[head]
-		head += 1
-
-		local assembly = registry:getAssemblyByPart(part)
-		if assembly then
-			for assemblyPart in assembly.parts do
-				enqueue(assemblyPart)
-			end
-		end
-
-		if context then
-			context:consume("supportQueries", 1)
-			context.stats.supportQueries += 1
-		end
-		for _, nearbyPart in Workspace:GetPartBoundsInBox(part.CFrame, expandedSize(part), overlapParams) do
-			if not nearbyPart:IsA("BasePart") or nearbyPart == part or not isActiveVoxelPart(registry, nearbyPart) then
-				continue
-			end
-
-			if obbTouches(part.CFrame, part.Size, nearbyPart.CFrame, nearbyPart.Size, CONTACT_PADDING) then
-				enqueue(nearbyPart)
-			end
-		end
-	end
-
-	return islandParts
 end
 
 local function chooseRoot(parts: { BasePart }): BasePart?
@@ -229,8 +60,8 @@ local function chooseRootSticky(parts: { BasePart }, registry: any): BasePart?
 	local oldRootVotes: { [BasePart]: number } = {}
 	for _, part in parts do
 		local oldAssembly = registry:getAssemblyByPart(part)
-		if oldAssembly and oldAssembly.rootPart and partSet[oldAssembly.rootPart] then
-			local rootCandidate = oldAssembly.rootPart
+		local rootCandidate: BasePart? = if oldAssembly then oldAssembly.rootPart else nil
+		if rootCandidate and partSet[rootCandidate] then
 			oldRootVotes[rootCandidate] = (oldRootVotes[rootCandidate] or 0) + 1
 		end
 	end
@@ -264,105 +95,6 @@ local function planWeldForPart(registry: any, root: BasePart, part: BasePart): W
 		return existingWeld
 	end
 	return nil
-end
-
-local function buildContactGraph(registry: any, islandParts: { BasePart }, context: any?): ({ { number } }, { [number]: boolean })
-	local overlapParams = OverlapParams.new()
-	overlapParams.MaxParts = 0
-	overlapParams.RespectCanCollide = false
-
-	local indexByPart: { [BasePart]: number } = {}
-	local edges = table.create(#islandParts)
-	local directSupport: { [number]: boolean } = {}
-
-	for index, part in islandParts do
-		indexByPart[part] = index
-		edges[index] = {}
-	end
-
-	for index, part in islandParts do
-		if isExplicitSupportAnchor(part) then
-			directSupport[index] = true
-		end
-
-		if context then
-			context:consume("supportQueries", 1)
-			context.stats.supportQueries += 1
-		end
-		for _, nearbyPart in Workspace:GetPartBoundsInBox(part.CFrame, expandedSize(part), overlapParams) do
-			if not nearbyPart:IsA("BasePart") or nearbyPart == part then
-				continue
-			end
-
-			if isActiveVoxelPart(registry, nearbyPart) then
-				local neighborIndex = indexByPart[nearbyPart]
-				if neighborIndex and neighborIndex > index and obbTouches(part.CFrame, part.Size, nearbyPart.CFrame, nearbyPart.Size, CONTACT_PADDING) then
-					addEdge(edges, index, neighborIndex)
-				end
-			elseif isExternalSupport(registry, nearbyPart) and obbTouches(part.CFrame, part.Size, nearbyPart.CFrame, nearbyPart.Size, CONTACT_PADDING) then
-				directSupport[index] = true
-			end
-		end
-	end
-
-	return edges, directSupport
-end
-
-local function collectContactComponents(
-	islandParts: { BasePart },
-	edges: { { number } },
-	directSupport: { [number]: boolean },
-	newPartSet: { [BasePart]: boolean }
-)
-	local components = {}
-	local visited: { [number]: boolean } = {}
-
-	for startIndex = 1, #islandParts do
-		if visited[startIndex] then
-			continue
-		end
-
-		local queue = { startIndex }
-		local head = 1
-		local groupParts = {}
-		local supportPartSet: { [BasePart]: boolean } = {}
-		local supported = false
-		local containsNewPart = false
-		visited[startIndex] = true
-
-		while head <= #queue do
-			local index = queue[head]
-			head += 1
-
-			local part = islandParts[index]
-			groupParts[#groupParts + 1] = part
-
-			if directSupport[index] then
-				supported = true
-				supportPartSet[part] = true
-			end
-
-			if newPartSet[part] then
-				containsNewPart = true
-			end
-
-			for _, neighborIndex in edges[index] do
-				if not visited[neighborIndex] then
-					visited[neighborIndex] = true
-					queue[#queue + 1] = neighborIndex
-				end
-			end
-		end
-
-		components[#components + 1] = {
-			parts = groupParts,
-			supportPartSet = supportPartSet,
-			supported = supported,
-			containsNewPart = containsNewPart,
-		}
-	end
-
-	return components
 end
 
 type WeldPlan = {
@@ -411,7 +143,7 @@ local function collectDirtyParts(
 	newParts: { BasePart }?,
 	context: any?
 ): ({ BasePart }, { [BasePart]: boolean })
-	local dirtyParts = {}
+	local dirtyParts = {} :: { BasePart }
 	local dirtySet: { [BasePart]: boolean } = {}
 	local newPartSet: { [BasePart]: boolean } = {}
 
@@ -438,8 +170,8 @@ local function collectDirtyParts(
 	return dirtyParts, newPartSet
 end
 
-local function collectGraphComponents(registry: any, seedParts: { BasePart }, newPartSet: { [BasePart]: boolean }, context: any?)
-	local components = {}
+local function collectGraphComponents(registry: any, seedParts: { BasePart }, newPartSet: { [BasePart]: boolean }, context: any?): { GraphComponent }
+	local components = {} :: { GraphComponent }
 	local visited: { [BasePart]: boolean } = {}
 
 	for _, startPart in seedParts do
@@ -447,13 +179,13 @@ local function collectGraphComponents(registry: any, seedParts: { BasePart }, ne
 			continue
 		end
 
-		local queue = { startPart }
+		local queue = { startPart } :: { BasePart }
 		local head = 1
-		local groupParts = {}
+		local groupParts = {} :: { BasePart }
 		local supportPartSet: { [BasePart]: boolean } = {}
 		local supported = false
 		local containsNewPart = false
-		local newParts = {}
+		local newParts = {} :: { BasePart }
 		local oldAssemblyCounts: { [any]: number } = {}
 		local oldAssemblyKinds = 0
 		local onlyOldAssembly = nil :: any?
@@ -506,13 +238,14 @@ local function collectGraphComponents(registry: any, seedParts: { BasePart }, ne
 		local unchangedAssembly = nil :: any?
 		local augmentAssembly = nil :: any?
 
-		if oldAssembly and oldAssembly.rootPart and oldAssembly.supported == supported then
+		local oldAssemblyRoot: BasePart? = if oldAssembly then oldAssembly.rootPart else nil
+		if oldAssembly and oldAssemblyRoot and oldAssembly.supported == supported then
 			if #newParts == 0 and oldAssembly.partCount == #groupParts then
-				if assemblyWeldsLookValid(oldAssembly, oldAssembly.rootPart, groupParts) then
+				if assemblyWeldsLookValid(oldAssembly, oldAssemblyRoot, groupParts) then
 					unchangedAssembly = oldAssembly
 				end
 			elseif #newParts > 0 and oldAssembly.partCount == oldAssemblyPartCount then
-				if assemblyWeldsLookValid(oldAssembly, oldAssembly.rootPart, groupParts) then
+				if assemblyWeldsLookValid(oldAssembly, oldAssemblyRoot, groupParts) then
 					augmentAssembly = oldAssembly
 				end
 			end
@@ -549,7 +282,22 @@ function SupportGraph.refreshAroundDamage(
 		return result
 	end
 
-	registry:rebuildSupportContacts(dirtyParts, context)
+	-- Restrict the contact-rebuild set to parts physically near the damage
+	-- region: only those could have had a neighbor added (a new chunk) or
+	-- removed (the source). Transitively-affected parts further out keep
+	-- their cached contacts and are reused via ensureSupportContacts during
+	-- the graph traversal below.
+	local rebuildParts = dirtyParts
+	if queryCFrame and querySize then
+		rebuildParts = table.create(#dirtyParts) :: { BasePart }
+		for _, part in dirtyParts do
+			if newPartSet[part] or ShapeTests.partsTouch(part.CFrame, part.Size, queryCFrame, querySize, 0) then
+				rebuildParts[#rebuildParts + 1] = part
+			end
+		end
+	end
+
+	registry:rebuildSupportContacts(rebuildParts, context)
 	local components = collectGraphComponents(registry, dirtyParts, newPartSet, context)
 	if context then
 		context.stats.supportIslandParts += #dirtyParts
@@ -557,10 +305,10 @@ function SupportGraph.refreshAroundDamage(
 
 	-- Phase 1: lay out the new assemblies with sticky roots, plan welds.
 	local newAssemblies: { NewAssemblyPlan } = {}
-	local augmentAssemblies = {}
+	local augmentAssemblies = {} :: { GraphComponent }
 	local weldPlans: { WeldPlan } = {}
 	local claimedSet: { [WeldConstraint]: boolean } = {}
-	local changedParts = {}
+	local changedParts = {} :: { BasePart }
 	local changedPartSet: { [BasePart]: boolean } = {}
 
 	local function markChanged(part: BasePart)
@@ -640,7 +388,7 @@ function SupportGraph.refreshAroundDamage(
 
 	-- Phase 2: destroy welds that weren't claimed (touching changed parts).
 	for _, oldAssembly in affectedAssemblies do
-		local snapshot = {}
+		local snapshot = {} :: { WeldConstraint }
 		for weld in oldAssembly.welds do
 			snapshot[#snapshot + 1] = weld
 		end
@@ -752,8 +500,9 @@ function SupportGraph.refreshAroundDamage(
 			part:SetAttribute("PartBreaker2ContactIslandId", islandId)
 		end
 
-		if not component.supported and component.containsNewPart and assembly.rootPart then
-			result.unsupportedNewRoots[#result.unsupportedNewRoots + 1] = assembly.rootPart
+		local augmentRoot: BasePart? = assembly.rootPart
+		if not component.supported and component.containsNewPart and augmentRoot then
+			result.unsupportedNewRoots[#result.unsupportedNewRoots + 1] = augmentRoot
 		end
 	end
 

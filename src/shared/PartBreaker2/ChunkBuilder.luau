@@ -175,7 +175,7 @@ local function partVolume(part: BasePart): number
 	return size.X * size.Y * size.Z
 end
 
-local function chooseRoot(parts: { BasePart })
+local function chooseRoot(parts: { BasePart }): BasePart?
 	local root = nil :: BasePart?
 	local largestVolume = -math.huge
 	for _, part in parts do
@@ -194,7 +194,7 @@ local function chooseRoot(parts: { BasePart })
 end
 
 function ChunkBuilder.buildChunks(self: Builder, sourceRecord: any, components: { Component }, context: BudgetContext?, lazyGeneratedGrid: boolean): { BuiltAssembly }
-	local builtAssemblies = table.create(#components)
+	local builtAssemblies = table.create(#components) :: { BuiltAssembly }
 
 	for componentIndex, component in components do
 		local cuboids = component.cuboids
@@ -202,7 +202,7 @@ function ChunkBuilder.buildChunks(self: Builder, sourceRecord: any, components: 
 			continue
 		end
 
-		local componentParts = table.create(#cuboids)
+		local componentParts = table.create(#cuboids) :: { BasePart }
 		for _, cuboid in cuboids do
 			if context then
 				context:consume("partsCommitted", 1)

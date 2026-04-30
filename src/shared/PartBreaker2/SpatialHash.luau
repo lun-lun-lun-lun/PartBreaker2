@@ -38,8 +38,8 @@ end
 function SpatialHash.new(cellSize: number): Hash
 	return setmetatable({
 		cellSize = math.max(1, cellSize),
-		buckets = {},
-		partCells = {},
+		buckets = {} :: { [string]: { [BasePart]: true } },
+		partCells = {} :: { [BasePart]: { [string]: true } },
 	}, SpatialHash) :: Hash
 end
 
@@ -80,7 +80,7 @@ function SpatialHash.insert(self: Hash, part: BasePart)
 				local key = cellKey(x, y, z)
 				local bucket = self.buckets[key]
 				if not bucket then
-					bucket = {}
+					bucket = {} :: { [BasePart]: true }
 					self.buckets[key] = bucket
 				end
 				bucket[part] = true
@@ -104,7 +104,7 @@ function SpatialHash.queryAABB(self: Hash, cframe: CFrame, size: Vector3, paddin
 	local maxX = cellCoord(maxPoint.X, self.cellSize)
 	local maxY = cellCoord(maxPoint.Y, self.cellSize)
 	local maxZ = cellCoord(maxPoint.Z, self.cellSize)
-	local parts = outParts or {}
+	local parts = outParts or ({} :: { BasePart })
 	local seen: { [BasePart]: boolean } = {}
 
 	for x = minX, maxX do

@@ -89,7 +89,7 @@ end
 
 local function makeRandomVoxelPart(random: Random, parent: Instance, index: number)
 	local useWedge = random:NextNumber() < 0.28
-	local part = if useWedge then Instance.new("WedgePart") else Instance.new("Part")
+	local part: BasePart = if useWedge then Instance.new("WedgePart") else Instance.new("Part")
 	part.Name = if useWedge then `VoxelWedge_{index}` else `VoxelBlock_{index}`
 	part.Size = Vector3.new(
 		randomRange(random, 5, 13),
@@ -416,7 +416,7 @@ function VoxelDestructionTest.start(partBreaker: any)
 	end)
 	local network = getNetworkServer()
 	if network and network.ToolActivated then
-		network.ToolActivated.On(function(player: Player, targetPosition: Vector3)
+		(network.ToolActivated :: any).On(function(player: Player, targetPosition: Vector3)
 			useToolAtMouse(partBreaker, player, targetPosition)
 		end)
 	end

@@ -36,12 +36,28 @@ local function clampInteger(value: number, minValue: number, maxValue: number): 
 end
 
 local function nextStamp(grid: Grid, field: "visitStamp" | "meshStamp" | "mergedStamp", stampBuffer: buffer): number
-	local stamp = grid[field] + 1
+	local current
+	if field == "visitStamp" then
+		current = grid.visitStamp
+	elseif field == "meshStamp" then
+		current = grid.meshStamp
+	else
+		current = grid.mergedStamp
+	end
+
+	local stamp = current + 1
 	if stamp > MAX_U16_STAMP then
 		buffer.fill(stampBuffer, 0, 0)
 		stamp = 1
 	end
-	grid[field] = stamp
+
+	if field == "visitStamp" then
+		grid.visitStamp = stamp
+	elseif field == "meshStamp" then
+		grid.meshStamp = stamp
+	else
+		grid.mergedStamp = stamp
+	end
 	return stamp
 end
 

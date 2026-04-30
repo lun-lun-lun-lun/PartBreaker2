@@ -27,8 +27,10 @@ local originals: { [BasePart]: OriginalVisual } = {}
 local colorsByKey: { [string]: Color3 } = {}
 
 local function isVisualizerTool(instance: Instance): boolean
-	return instance:IsA("Tool")
-		and instance:GetAttribute("PartBreaker2VisualizerTool") == true
+	if not instance:IsA("Tool") then
+		return false
+	end
+	return instance:GetAttribute("PartBreaker2VisualizerTool") == true
 		and typeof(instance:GetAttribute("PartBreaker2VisualizerMode")) == "string"
 end
 
@@ -42,9 +44,9 @@ local function getColorForKey(key: string): Color3
 		return color
 	end
 
-	color = randomColor()
-	colorsByKey[key] = color
-	return color
+	local newColor = randomColor()
+	colorsByKey[key] = newColor
+	return newColor
 end
 
 local function getGroupKey(part: BasePart, mode: string): string?
@@ -57,18 +59,21 @@ local function getGroupKey(part: BasePart, mode: string): string?
 		return nil
 	end
 
-	local assemblyId = part:GetAttribute("PartBreaker2AssemblyId")
-	if typeof(assemblyId) == "number" then
-		return `attached:{assemblyId}`
+	if mode == ATTACHED_MODE then
+		local assemblyId = part:GetAttribute("PartBreaker2AssemblyId")
+		if typeof(assemblyId) == "number" then
+			return `attached:{assemblyId}`
+		end
 	end
 
 	return nil
 end
 
 local function isVisualizableVoxelPart(instance: Instance): boolean
-	return instance:IsA("BasePart")
-		and instance.Parent ~= nil
-		and instance:GetAttribute("VoxelPart") == true
+	if not instance:IsA("BasePart") then
+		return false
+	end
+	return instance.Parent ~= nil and instance:GetAttribute("VoxelPart") == true
 end
 
 local function storeOriginal(part: BasePart)

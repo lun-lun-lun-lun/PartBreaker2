@@ -78,7 +78,7 @@ local function bindTool(tool: Tool)
 		end
 
 		if network and network.ToolActivated then
-			network.ToolActivated.Fire(mouse.Hit.Position)
+			(network.ToolActivated :: any).Fire(mouse.Hit.Position)
 			return
 		end
 

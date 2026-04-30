@@ -57,7 +57,7 @@ function GreedyMesher.meshComponent(grid: VoxelGrid.Grid, component: Component, 
 		VoxelGrid.markMesh(grid, index, meshStamp)
 	end
 
-	local cuboids = table.create(math.min(#component.indices, cuboidLimit) + 1)
+	local cuboids = table.create(math.min(#component.indices, cuboidLimit) + 1) :: { Cuboid }
 	local emitted = 0
 	local overflowed = false
 	local overflowMinX, overflowMinY, overflowMinZ = math.huge, math.huge, math.huge

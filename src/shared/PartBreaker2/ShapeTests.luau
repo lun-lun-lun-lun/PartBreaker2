@@ -6,6 +6,7 @@ local VoxelGrid = require(script.Parent.VoxelGrid)
 local ShapeTests = {}
 
 local EPSILON = 1e-6
+local AXIS_ALIGNMENT_EPSILON = 1e-4
 
 local function abs(value: number): number
 	return if value < 0 then -value else value
@@ -149,6 +150,120 @@ function ShapeTests.obbContainsVoxel(grid: VoxelGrid.Grid, localOBB: CFrame, siz
 	if projZ > obbHalf.Z then return false end
 
 	return true
+end
+
+-- A CFrame is "axis-aligned" iff each rotation axis vector has all of its
+-- magnitude in a single world-axis component (so it's one of the 24 orientations
+-- formed by 90° turns). For a unit vector this happens iff the sum of |components|
+-- equals 1. Orthonormality of CFrame guarantees the third axis follows from two.
+function ShapeTests.isAxisAligned(cframe: CFrame): boolean
+	local r = cframe.RightVector
+	local rSum = abs(r.X) + abs(r.Y) + abs(r.Z)
+	if rSum < 1 - AXIS_ALIGNMENT_EPSILON or rSum > 1 + AXIS_ALIGNMENT_EPSILON then
+		return false
+	end
+	local u = cframe.UpVector
+	local uSum = abs(u.X) + abs(u.Y) + abs(u.Z)
+	return uSum >= 1 - AXIS_ALIGNMENT_EPSILON and uSum <= 1 + AXIS_ALIGNMENT_EPSILON
+end
+
+-- AABB overlap test for two parts that are both axis-aligned in world space.
+-- For axis-aligned CFrames, the world-axis half-extents are the part's half-size
+-- components permuted by the rotation (each abs(axis component) is 0 or 1).
+function ShapeTests.partsTouchAabb(cframeA: CFrame, sizeA: Vector3, cframeB: CFrame, sizeB: Vector3, padding: number): boolean
+	local rA = cframeA.RightVector
+	local uA = cframeA.UpVector
+	local lA = cframeA.LookVector
+	local hAx = sizeA.X * 0.5 + padding
+	local hAy = sizeA.Y * 0.5 + padding
+	local hAz = sizeA.Z * 0.5 + padding
+	local aExtX = abs(rA.X) * hAx + abs(uA.X) * hAy + abs(lA.X) * hAz
+	local aExtY = abs(rA.Y) * hAx + abs(uA.Y) * hAy + abs(lA.Y) * hAz
+	local aExtZ = abs(rA.Z) * hAx + abs(uA.Z) * hAy + abs(lA.Z) * hAz
+
+	local rB = cframeB.RightVector
+	local uB = cframeB.UpVector
+	local lB = cframeB.LookVector
+	local hBx = sizeB.X * 0.5 + padding
+	local hBy = sizeB.Y * 0.5 + padding
+	local hBz = sizeB.Z * 0.5 + padding
+	local bExtX = abs(rB.X) * hBx + abs(uB.X) * hBy + abs(lB.X) * hBz
+	local bExtY = abs(rB.Y) * hBx + abs(uB.Y) * hBy + abs(lB.Y) * hBz
+	local bExtZ = abs(rB.Z) * hBx + abs(uB.Z) * hBy + abs(lB.Z) * hBz
+
+	local delta = cframeB.Position - cframeA.Position
+	if abs(delta.X) > aExtX + bExtX + EPSILON then return false end
+	if abs(delta.Y) > aExtY + bExtY + EPSILON then return false end
+	if abs(delta.Z) > aExtZ + bExtZ + EPSILON then return false end
+	return true
+end
+
+-- Full 15-axis OBB-OBB separating-axis test.
+function ShapeTests.partsTouchSat(cframeA: CFrame, sizeA: Vector3, cframeB: CFrame, sizeB: Vector3, padding: number): boolean
+	local aHalf = sizeA * 0.5 + Vector3.new(padding, padding, padding)
+	local bHalf = sizeB * 0.5 + Vector3.new(padding, padding, padding)
+	local ax = cframeA.RightVector
+	local ay = cframeA.UpVector
+	local az = cframeA.LookVector
+	local bx = cframeB.RightVector
+	local by = cframeB.UpVector
+	local bz = cframeB.LookVector
+	local centerDelta = cframeB.Position - cframeA.Position
+
+	local distance = abs(centerDelta:Dot(ax))
+	local radius = aHalf.X + bHalf.X * abs(ax:Dot(bx)) + bHalf.Y * abs(ax:Dot(by)) + bHalf.Z * abs(ax:Dot(bz))
+	if distance > radius + EPSILON then return false end
+	distance = abs(centerDelta:Dot(ay))
+	radius = aHalf.Y + bHalf.X * abs(ay:Dot(bx)) + bHalf.Y * abs(ay:Dot(by)) + bHalf.Z * abs(ay:Dot(bz))
+	if distance > radius + EPSILON then return false end
+	distance = abs(centerDelta:Dot(az))
+	radius = aHalf.Z + bHalf.X * abs(az:Dot(bx)) + bHalf.Y * abs(az:Dot(by)) + bHalf.Z * abs(az:Dot(bz))
+	if distance > radius + EPSILON then return false end
+
+	distance = abs(centerDelta:Dot(bx))
+	radius = bHalf.X + aHalf.X * abs(bx:Dot(ax)) + aHalf.Y * abs(bx:Dot(ay)) + aHalf.Z * abs(bx:Dot(az))
+	if distance > radius + EPSILON then return false end
+	distance = abs(centerDelta:Dot(by))
+	radius = bHalf.Y + aHalf.X * abs(by:Dot(ax)) + aHalf.Y * abs(by:Dot(ay)) + aHalf.Z * abs(by:Dot(az))
+	if distance > radius + EPSILON then return false end
+	distance = abs(centerDelta:Dot(bz))
+	radius = bHalf.Z + aHalf.X * abs(bz:Dot(ax)) + aHalf.Y * abs(bz:Dot(ay)) + aHalf.Z * abs(bz:Dot(az))
+	if distance > radius + EPSILON then return false end
+
+	for axisIndex = 1, 9 do
+		local aAxis: Vector3
+		local bAxis: Vector3
+		if axisIndex <= 3 then
+			aAxis = ax
+			bAxis = if axisIndex == 1 then bx elseif axisIndex == 2 then by else bz
+		elseif axisIndex <= 6 then
+			aAxis = ay
+			bAxis = if axisIndex == 4 then bx elseif axisIndex == 5 then by else bz
+		else
+			aAxis = az
+			bAxis = if axisIndex == 7 then bx elseif axisIndex == 8 then by else bz
+		end
+
+		local axis = aAxis:Cross(bAxis)
+		if axis:Dot(axis) <= EPSILON then
+			continue
+		end
+
+		local d = abs(centerDelta:Dot(axis))
+		local rA = aHalf.X * abs(axis:Dot(ax)) + aHalf.Y * abs(axis:Dot(ay)) + aHalf.Z * abs(axis:Dot(az))
+		local rB = bHalf.X * abs(axis:Dot(bx)) + bHalf.Y * abs(axis:Dot(by)) + bHalf.Z * abs(axis:Dot(bz))
+		if d > rA + rB + EPSILON then return false end
+	end
+
+	return true
+end
+
+-- Dispatcher: AABB fast-path when both parts are axis-aligned, else full SAT.
+function ShapeTests.partsTouch(cframeA: CFrame, sizeA: Vector3, cframeB: CFrame, sizeB: Vector3, padding: number): boolean
+	if ShapeTests.isAxisAligned(cframeA) and ShapeTests.isAxisAligned(cframeB) then
+		return ShapeTests.partsTouchAabb(cframeA, sizeA, cframeB, sizeB, padding)
+	end
+	return ShapeTests.partsTouchSat(cframeA, sizeA, cframeB, sizeB, padding)
 end
 
 function ShapeTests.obbIntersectsVoxel(grid: VoxelGrid.Grid, localOBB: CFrame, size: Vector3, x: number, y: number, z: number): boolean

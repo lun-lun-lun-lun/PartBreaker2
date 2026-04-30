@@ -3,8 +3,8 @@
 local FAR_AWAY_CFRAME = CFrame.new(2^24, 2^24, 2^24)
 local EXPAND_BY_AMOUNT = 50
 
-local MovingParts = table.create(10_000)
-local MovingCFrames = table.create(10_000)
+local MovingParts = table.create(10_000) :: { BasePart }
+local MovingCFrames = table.create(10_000) :: { CFrame }
 
 local ScheduledUpdate = false
 local function UpdateMovement()
@@ -23,7 +23,38 @@ local UpdateMovementThread = coroutine.create(UpdateMovement)
 local Cache = {}
 Cache.__index = Cache
 
-function Cache:_GetNew(Amount: number, Warn: boolean)
+type CacheData = {
+	CacheHolder: Folder,
+	_ExpandAmount: number,
+	_Template: BasePart | Model,
+	_FreeObjects: { BasePart },
+	_Objects: { [BasePart]: boolean },
+	_IsTemplateModel: boolean,
+	_PreallocatedAmount: number,
+}
+
+export type CacheInstance = CacheData & {
+	_GetNew: (CacheInstance, number, boolean) -> BasePart,
+	GetPart: (CacheInstance, CFrame?) -> BasePart,
+	ReturnPart: (CacheInstance, BasePart) -> (),
+	Update: (CacheInstance) -> (),
+	ExpandCache: (CacheInstance, number) -> (),
+	SetExpandAmount: (CacheInstance, number) -> (),
+	IsInUse: (CacheInstance, BasePart) -> boolean,
+	Destroy: (CacheInstance) -> (),
+}
+
+local function getObjectRoot(object: BasePart | Model, isModel: boolean): BasePart
+	if isModel then
+		local root = (object :: Model).PrimaryPart
+		assert(root ~= nil, "ObjectCache: cloned model is missing PrimaryPart")
+		return root
+	end
+
+	return object :: BasePart
+end
+
+function Cache._GetNew(self: CacheInstance, Amount: number, Warn: boolean): BasePart
 	if Warn then
 		warn(`ObjectCache: Cache retrieval exceeded preallocated amount! expanding by {Amount}...`)
 	end
@@ -35,12 +66,12 @@ function Cache:_GetNew(Amount: number, Warn: boolean)
 	local IsTemplateModel = self._IsTemplateModel
 	local Template: Model | BasePart = self._Template
 
-	local TargetParts = table.create(Amount)
-	local TargetCFrames = table.create(Amount)
-	local AddedObjects = table.create(Amount)
+	local TargetParts = table.create(Amount) :: { BasePart }
+	local TargetCFrames = table.create(Amount) :: { CFrame }
+	local AddedObjects = table.create(Amount) :: { Instance }
 	for Index = InitialLength + 1, InitialLength + Amount do
-		local Object = Template:Clone()
-		local ObjectRoot: BasePart = if IsTemplateModel then (Object:: Model).PrimaryPart:: BasePart else Object:: BasePart
+		local Object = (Template:Clone() :: any) :: BasePart | Model
+		local ObjectRoot = getObjectRoot(Object, IsTemplateModel)
 
 		FreeObjectsContainer[Index] = ObjectRoot
 
@@ -53,14 +84,16 @@ function Cache:_GetNew(Amount: number, Warn: boolean)
 	workspace:BulkMoveTo(TargetParts, TargetCFrames, Enum.BulkMoveMode.FireCFrameChanged)
 
 	for _, Object in AddedObjects do
-		(Object:: Instance).Parent = CacheHolder
+		Object.Parent = CacheHolder
 	end
 
-	return table.remove(FreeObjectsContainer)
+	local part = table.remove(FreeObjectsContainer)
+	assert(part ~= nil, "ObjectCache: failed to allocate a new object")
+	return part
 end
 
-function Cache:GetPart(PartCFrame: CFrame?): BasePart
-	local Part = table.remove(self._FreeObjects) or self:_GetNew(self._ExpandAmount, true)
+function Cache.GetPart(self: CacheInstance, PartCFrame: CFrame?): BasePart
+	local Part = table.remove(self._FreeObjects) or Cache._GetNew(self, self._ExpandAmount, true)
 
 	self._Objects[Part] = nil
 	if PartCFrame then
@@ -75,7 +108,7 @@ function Cache:GetPart(PartCFrame: CFrame?): BasePart
 
 	return Part
 end
-function Cache:ReturnPart(Part: BasePart)
+function Cache.ReturnPart(self: CacheInstance, Part: BasePart)
 	if self._Objects[Part] then
 		return
 	end
@@ -92,28 +125,28 @@ function Cache:ReturnPart(Part: BasePart)
 	end
 end
 
-function Cache:Update()
+function Cache.Update(_self: CacheInstance)
 	task.spawn(UpdateMovementThread)
 end
 
-function Cache:ExpandCache(Amount: number)
+function Cache.ExpandCache(self: CacheInstance, Amount: number)
 	assert(typeof(Amount) ~= "number" or Amount >= 0, `Invalid argument #1 to 'ObjectCache:ExpandCache' (positive number expected, got {typeof(Amount)})`)
-	self:_GetNew(Amount, false)
+	Cache._GetNew(self, Amount, false)
 end
-function Cache:SetExpandAmount(Amount: number)
+function Cache.SetExpandAmount(self: CacheInstance, Amount: number)
 	assert(typeof(Amount) ~= "number" or Amount > 0, `Invalid argument #1 to 'ObjectCache:SetExpandAmount' (positive number expected, got {typeof(Amount)})`)
 	self._ExpandAmount = Amount
 end
 
-function Cache:IsInUse(Object: BasePart): boolean
+function Cache.IsInUse(self: CacheInstance, Object: BasePart): boolean
 	return self._Objects[Object] == nil
 end
 
-function Cache:Destroy()
+function Cache.Destroy(self: CacheInstance)
 	self.CacheHolder:Destroy()
 end
 
-local function GetCacheContainer()
+local function GetCacheContainer(): Folder
 	local CacheHolder = Instance.new("Folder")
 	CacheHolder.Name = "ObjectCache"
 
@@ -121,7 +154,7 @@ local function GetCacheContainer()
 end
 
 local Constructor = {}
-function Constructor.new(Template: BasePart | Model, CacheSize: number?, CachesContainer: Instance?)
+function Constructor.new(Template: BasePart | Model, CacheSize: number?, CachesContainer: Instance?): CacheInstance
 	local TemplateType = typeof(Template)
 	assert(TemplateType == "Instance", `Invalid argument #1 to 'ObjectCache.new' (BasePart expected, got {TemplateType})`)
 
@@ -142,25 +175,23 @@ function Constructor.new(Template: BasePart | Model, CacheSize: number?, CachesC
 	local CacheParent = GetCacheContainer()
 
 	local Objects: {[BasePart]: boolean} = {}
-	local FreeObjects: {BasePart | Model} = table.create(PreallocAmount)
-
-	local TargetParts = table.create(PreallocAmount)
+	local TargetParts = table.create(PreallocAmount) :: { BasePart }
 
 	local IsTemplateModel = Template:IsA("Model")
 	for Index = 1, PreallocAmount do
-		local Object = Template:Clone()
-		local ObjectRoot: BasePart = if IsTemplateModel then (Object:: Model).PrimaryPart:: BasePart else Object:: BasePart
+		local Object = (Template:Clone() :: any) :: BasePart | Model
+		local ObjectRoot = getObjectRoot(Object, IsTemplateModel)
 
-		FreeObjects[Index] = Object
 		TargetParts[Index] = ObjectRoot
 
-		ObjectRoot.CFrame = FAR_AWAY_CFRAME;
-		(Object:: Instance).Parent = CacheParent
+		ObjectRoot.CFrame = FAR_AWAY_CFRAME
+		local ObjectInstance = Object :: Instance
+		ObjectInstance.Parent = CacheParent
 	end
 
 	CacheParent.Parent = CachesContainer or workspace
 
-	return setmetatable({
+	local self = ({
 		CacheHolder = CacheParent,
 		_ExpandAmount = EXPAND_BY_AMOUNT,
 		_Template = Template,
@@ -168,7 +199,8 @@ function Constructor.new(Template: BasePart | Model, CacheSize: number?, CachesC
 		_Objects = Objects,
 		_IsTemplateModel = IsTemplateModel,
 		_PreallocatedAmount = PreallocAmount,
-	}, Cache)
+	} :: any) :: CacheData
+	return (setmetatable(self, Cache) :: any) :: CacheInstance
 end
 
 return Constructor

@@ -3,6 +3,7 @@
 
 local Workspace = game:GetService("Workspace")
 
+local ShapeTests = require(script.Parent.ShapeTests)
 local SpatialHash = require(script.Parent.SpatialHash)
 local VoxelGrid = require(script.Parent.VoxelGrid)
 local Types = require(script.Parent.Types)
@@ -56,6 +57,7 @@ export type Registry = typeof(setmetatable(
 		contactNeighborsByPart: { [BasePart]: { [BasePart]: true } },
 		directSupportByPart: { [BasePart]: boolean },
 		supportContactsValid: { [BasePart]: boolean },
+		externalSupportValid: { [BasePart]: boolean },
 		pendingConfig: { [BasePart]: VoxelPartConfig },
 		overlapParams: OverlapParams,
 		maxBroadphaseParts: number,
@@ -71,71 +73,6 @@ local DEFAULT_DEBRIS_LIFETIME = 2.5
 local DEFAULT_DEBRIS_IMPULSE_MULTIPLIER = 1
 local SUPPORT_HASH_CELL_SIZE = 16
 local CONTACT_PADDING = 0.015
-
-local function abs(value: number): number
-	return if value < 0 then -value else value
-end
-
-local function obbTouches(cframeA: CFrame, sizeA: Vector3, cframeB: CFrame, sizeB: Vector3, padding: number): boolean
-	local aHalf = sizeA * 0.5 + Vector3.new(padding, padding, padding)
-	local bHalf = sizeB * 0.5 + Vector3.new(padding, padding, padding)
-	local aAxes = {
-		cframeA.RightVector,
-		cframeA.UpVector,
-		cframeA.LookVector,
-	}
-	local bAxes = {
-		cframeB.RightVector,
-		cframeB.UpVector,
-		cframeB.LookVector,
-	}
-	local centerDelta = cframeB.Position - cframeA.Position
-	local epsilon = 1e-6
-
-	for _, axis in aAxes do
-		local distance = abs(centerDelta:Dot(axis))
-		local radiusA = if axis == aAxes[1] then aHalf.X elseif axis == aAxes[2] then aHalf.Y else aHalf.Z
-		local radiusB = bHalf.X * abs(axis:Dot(bAxes[1]))
-			+ bHalf.Y * abs(axis:Dot(bAxes[2]))
-			+ bHalf.Z * abs(axis:Dot(bAxes[3]))
-		if distance > radiusA + radiusB + epsilon then
-			return false
-		end
-	end
-
-	for _, axis in bAxes do
-		local distance = abs(centerDelta:Dot(axis))
-		local radiusA = aHalf.X * abs(axis:Dot(aAxes[1]))
-			+ aHalf.Y * abs(axis:Dot(aAxes[2]))
-			+ aHalf.Z * abs(axis:Dot(aAxes[3]))
-		local radiusB = if axis == bAxes[1] then bHalf.X elseif axis == bAxes[2] then bHalf.Y else bHalf.Z
-		if distance > radiusA + radiusB + epsilon then
-			return false
-		end
-	end
-
-	for _, axisA in aAxes do
-		for _, axisB in bAxes do
-			local axis = axisA:Cross(axisB)
-			if axis:Dot(axis) <= epsilon then
-				continue
-			end
-
-			local distance = abs(centerDelta:Dot(axis))
-			local radiusA = aHalf.X * abs(axis:Dot(aAxes[1]))
-				+ aHalf.Y * abs(axis:Dot(aAxes[2]))
-				+ aHalf.Z * abs(axis:Dot(aAxes[3]))
-			local radiusB = bHalf.X * abs(axis:Dot(bAxes[1]))
-				+ bHalf.Y * abs(axis:Dot(bAxes[2]))
-				+ bHalf.Z * abs(axis:Dot(bAxes[3]))
-			if distance > radiusA + radiusB + epsilon then
-				return false
-			end
-		end
-	end
-
-	return true
-end
 
 local function expandedSize(part: BasePart): Vector3
 	return part.Size + Vector3.new(CONTACT_PADDING * 2, CONTACT_PADDING * 2, CONTACT_PADDING * 2)
@@ -217,15 +154,16 @@ function VoxelRegistry.new(): Registry
 	overlapParams.RespectCanCollide = false
 
 	return setmetatable({
-		recordsBySource = {},
-		recordsByQueryPart = {},
-		assembliesById = {},
-		assemblyByPart = {},
+		recordsBySource = {} :: { [BasePart]: Record },
+		recordsByQueryPart = {} :: { [BasePart]: Record },
+		assembliesById = {} :: { [number]: Assembly },
+		assemblyByPart = {} :: { [BasePart]: Assembly },
 		supportHash = SpatialHash.new(SUPPORT_HASH_CELL_SIZE),
-		contactNeighborsByPart = {},
-		directSupportByPart = {},
-		supportContactsValid = {},
-		pendingConfig = {},
+		contactNeighborsByPart = {} :: { [BasePart]: { [BasePart]: true } },
+		directSupportByPart = {} :: { [BasePart]: boolean },
+		supportContactsValid = {} :: { [BasePart]: boolean },
+		externalSupportValid = {} :: { [BasePart]: boolean },
+		pendingConfig = {} :: { [BasePart]: VoxelPartConfig },
 		overlapParams = overlapParams,
 		maxBroadphaseParts = 0,
 		nextAssemblyId = 1,
@@ -241,7 +179,7 @@ end
 local function getContactSet(self: Registry, part: BasePart): { [BasePart]: true }
 	local set = self.contactNeighborsByPart[part]
 	if not set then
-		set = {}
+		set = {} :: { [BasePart]: true }
 		self.contactNeighborsByPart[part] = set
 	end
 	return set
@@ -280,6 +218,7 @@ function VoxelRegistry.removeSupportPart(self: Registry, part: BasePart)
 	self.contactNeighborsByPart[part] = nil
 	self.directSupportByPart[part] = nil
 	self.supportContactsValid[part] = nil
+	self.externalSupportValid[part] = nil
 end
 
 function VoxelRegistry.getContactNeighborSet(self: Registry, part: BasePart): { [BasePart]: true }?
@@ -292,7 +231,7 @@ function VoxelRegistry.getContactNeighbors(self: Registry, part: BasePart): { Ba
 		return {}
 	end
 
-	local neighbors = {}
+	local neighbors = {} :: { BasePart }
 	for neighbor in set do
 		if self:isActiveVoxelPart(neighbor) then
 			neighbors[#neighbors + 1] = neighbor
@@ -314,7 +253,7 @@ function VoxelRegistry.getNearbySupportParts(self: Registry, cframe: CFrame, siz
 end
 
 function VoxelRegistry.rebuildSupportContacts(self: Registry, parts: { BasePart }, context: any?)
-	local dirtyParts = {}
+	local dirtyParts = {} :: { BasePart }
 	local dirtySet: { [BasePart]: boolean } = {}
 
 	for _, part in parts do
@@ -342,14 +281,23 @@ function VoxelRegistry.rebuildSupportContacts(self: Registry, parts: { BasePart 
 			end
 		end
 
-		self.contactNeighborsByPart[part] = {}
-		self.directSupportByPart[part] = false
+		self.contactNeighborsByPart[part] = {} :: { [BasePart]: true }
 		self.supportContactsValid[part] = true
+		-- Only invalidate the external-support flag if its cache is stale.
+		-- A part's external supports (anchored world geometry) don't change
+		-- when its voxel-voxel neighbors change, so we keep the cached value.
+		if not self.externalSupportValid[part] then
+			self.directSupportByPart[part] = false
+		end
 	end
 
 	local overlapParams = self.overlapParams
 	for _, part in dirtyParts do
-		for _, candidate in self:getNearbySupportParts(part.CFrame, part.Size, CONTACT_PADDING, context) do
+		local partCFrame = part.CFrame
+		local partSize = part.Size
+		local partAligned = ShapeTests.isAxisAligned(partCFrame)
+
+		for _, candidate in self:getNearbySupportParts(partCFrame, partSize, CONTACT_PADDING, context) do
 			if candidate == part or not self:isActiveVoxelPart(candidate) then
 				continue
 			end
@@ -357,33 +305,61 @@ function VoxelRegistry.rebuildSupportContacts(self: Registry, parts: { BasePart 
 			if context then
 				context.stats.supportContactTests += 1
 			end
-			if obbTouches(part.CFrame, part.Size, candidate.CFrame, candidate.Size, CONTACT_PADDING) then
+			local candidateCFrame = candidate.CFrame
+			local candidateSize = candidate.Size
+			local touch
+			if partAligned and ShapeTests.isAxisAligned(candidateCFrame) then
+				touch = ShapeTests.partsTouchAabb(partCFrame, partSize, candidateCFrame, candidateSize, CONTACT_PADDING)
+			else
+				touch = ShapeTests.partsTouchSat(partCFrame, partSize, candidateCFrame, candidateSize, CONTACT_PADDING)
+			end
+			if touch then
 				addContactEdge(self, part, candidate, context)
 			end
 		end
 
-		if context then
-			context:consume("supportQueries", 1)
-			context.stats.supportQueries += 1
-			context.stats.supportWorkspaceQueries += 1
-		end
-		for _, nearbyPart in Workspace:GetPartBoundsInBox(part.CFrame, expandedSize(part), overlapParams) do
-			if not nearbyPart:IsA("BasePart") or nearbyPart == part then
-				continue
-			end
-			if not isExternalSupport(self, nearbyPart) then
-				continue
-			end
-
+		-- External-support workspace query is the most expensive step here
+		-- (it crosses into the engine spatial index for every dirty part).
+		-- Skip it entirely when our cached answer is still valid.
+		if not self.externalSupportValid[part] then
 			if context then
-				context.stats.supportContactTests += 1
+				context:consume("supportQueries", 1)
+				context.stats.supportQueries += 1
+				context.stats.supportWorkspaceQueries += 1
 			end
-			if obbTouches(part.CFrame, part.Size, nearbyPart.CFrame, nearbyPart.Size, CONTACT_PADDING) then
-				self.directSupportByPart[part] = true
-				break
+			for _, nearbyPart in Workspace:GetPartBoundsInBox(partCFrame, expandedSize(part), overlapParams) do
+				if not nearbyPart:IsA("BasePart") or nearbyPart == part then
+					continue
+				end
+				if not isExternalSupport(self, nearbyPart) then
+					continue
+				end
+
+				if context then
+					context.stats.supportContactTests += 1
+				end
+				local nearbyCFrame = nearbyPart.CFrame
+				local nearbySize = nearbyPart.Size
+				local touch
+				if partAligned and ShapeTests.isAxisAligned(nearbyCFrame) then
+					touch = ShapeTests.partsTouchAabb(partCFrame, partSize, nearbyCFrame, nearbySize, CONTACT_PADDING)
+				else
+					touch = ShapeTests.partsTouchSat(partCFrame, partSize, nearbyCFrame, nearbySize, CONTACT_PADDING)
+				end
+				if touch then
+					self.directSupportByPart[part] = true
+					break
+				end
 			end
+			self.externalSupportValid[part] = true
 		end
 	end
+end
+
+-- Invalidate the external-support cache for a part. Call this when the part
+-- itself moves or when nearby anchored world geometry is added/removed/moved.
+function VoxelRegistry.invalidateExternalSupport(self: Registry, part: BasePart)
+	self.externalSupportValid[part] = nil
 end
 
 function VoxelRegistry.ensureSupportContacts(self: Registry, part: BasePart, context: any?)
@@ -401,9 +377,9 @@ function VoxelRegistry.registerAssembly(self: Registry, assemblyId: number, part
 			id = assemblyId,
 			supported = supported,
 			rootPart = rootPart,
-			parts = {},
-			welds = {},
-			weldByPart = {},
+			parts = {} :: { [BasePart]: true },
+			welds = {} :: { [WeldConstraint]: true },
+			weldByPart = {} :: { [BasePart]: WeldConstraint },
 			partCount = 0,
 			weldCount = 0,
 		}
@@ -522,7 +498,7 @@ function VoxelRegistry.getAssemblyParts(self: Registry, assemblyId: number): { B
 		return {}
 	end
 
-	local parts = table.create(assembly.partCount)
+	local parts = table.create(assembly.partCount) :: { BasePart }
 	for part in assembly.parts do
 		parts[#parts + 1] = part
 	end
@@ -634,14 +610,15 @@ function VoxelRegistry.ensureGrid(self: Registry, record: Record, context: any?)
 	end
 
 	local config = mergedConfig(record.part, self.pendingConfig[record.part])
-	record.grid = VoxelGrid.create(record.part, config.voxelSize :: number, record.part:IsA("WedgePart"))
+	local grid = VoxelGrid.create(record.part, config.voxelSize :: number, record.part:IsA("WedgePart"))
+	record.grid = grid
 	record.lazyGrid = false
 	record.part:SetAttribute("PartBreaker2LazyGrid", false)
 	if context then
 		context.stats.lazyGridsCreated += 1
 	end
 
-	return record.grid :: VoxelGrid.Grid
+	return grid
 end
 
 function VoxelRegistry.registerQueryPart(self: Registry, part: BasePart, record: Record)
@@ -694,7 +671,7 @@ function VoxelRegistry.registerPart(self: Registry, model: Model, part: BasePart
 		color = part.Color,
 		transparency = part.Transparency,
 		collisionGroup = part.CollisionGroup,
-		chunks = {},
+		chunks = {} :: { BasePart },
 		sourceHidden = false,
 	}
 
@@ -719,7 +696,7 @@ function VoxelRegistry.registerModel(self: Registry, model: Model)
 end
 
 function VoxelRegistry.unregisterModel(self: Registry, model: Model)
-	local toRemove = table.create(8)
+	local toRemove = table.create(8) :: { Record }
 	for part, record in self.recordsBySource do
 		if record.model == model then
 			toRemove[#toRemove + 1] = record
@@ -747,7 +724,7 @@ function VoxelRegistry.getRecordFromQueryPart(self: Registry, part: BasePart): R
 end
 
 function VoxelRegistry.collectRecordsFromParts(self: Registry, parts: { BasePart }): { Record }
-	local found = table.create(#parts)
+	local found = table.create(#parts) :: { Record }
 	local seen: { [Record]: boolean } = {}
 
 	for _, part in parts do

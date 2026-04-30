@@ -19,13 +19,13 @@ local NEIGHBOR_OFFSETS = {
 }
 
 function Connectivity.extractComponents(grid: VoxelGrid.Grid, context: BudgetContext?): { Component }
-	local components = table.create(8)
+	local components = table.create(8) :: { Component }
 	if grid.solidCount <= 0 then
 		return components
 	end
 
 	local stamp = VoxelGrid.beginVisit(grid)
-	local queue = table.create(1024)
+	local queue = table.create(1024) :: { number }
 
 	for startIndex = 0, grid.total - 1 do
 		if context then
@@ -37,7 +37,7 @@ function Connectivity.extractComponents(grid: VoxelGrid.Grid, context: BudgetCon
 			continue
 		end
 
-		local indices = table.create(256)
+		local indices = table.create(256) :: { number }
 		local head = 1
 		local tail = 1
 		queue[1] = startIndex
@@ -45,7 +45,7 @@ function Connectivity.extractComponents(grid: VoxelGrid.Grid, context: BudgetCon
 
 		while head <= tail do
 			local index = queue[head]
-			queue[head] = nil
+			queue[head] = nil :: any
 			head += 1
 			if context then
 				context:consume("connectivityVisits", 1)

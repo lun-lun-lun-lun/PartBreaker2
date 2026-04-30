@@ -115,16 +115,10 @@ local function flushReturnedParts()
 end
 
 local function materialFromValue(value: any): Enum.Material
-	if typeof(value) == "number" then
-		local material = Enum.Material:FromValue(value)
-		if material then
-			return material
-		end
-	end
-
-	local name = if typeof(value) == "string" then value else "Plastic"
+	local numericValue = if typeof(value) == "number" then value else nil
+	local name = if typeof(value) == "string" then value else nil
 	for _, material in Enum.Material:GetEnumItems() do
-		if material.Name == name then
+		if material.Value == numericValue or material.Name == name then
 			return material :: Enum.Material
 		end
 	end
@@ -223,7 +217,7 @@ local function step(dt: number)
 		if shard.age >= shard.lifetime then
 			returnPart(shard.part)
 			active[index] = active[#active]
-			active[#active] = nil
+			active[#active] = nil :: any
 			continue
 		end
 
@@ -270,7 +264,7 @@ function VoxelDebrisClient.start()
 
 	local network = getNetworkClient()
 	if network and network.Debris then
-		network.Debris.On(function(payload)
+		(network.Debris :: any).On(function(payload)
 			handlePayload(payload)
 		end)
 	end
