@@ -630,12 +630,11 @@ local function migrateAuthoredWelds(descriptors: { AuthoredWeldDescriptor }, bui
 	end
 end
 
-local function applyImpulseToRoots(roots: { BasePart }, impulse: Vector3?)
-	local wakeImpulse = if impulse and impulse.Magnitude > 0 then impulse else FALL_WAKE_DELTA_VELOCITY
+local function applyWakeToRoots(roots: { BasePart })
 	for _, root in roots do
 		task.defer(function()
 			if root.Parent ~= nil and not root.Anchored then
-				root:ApplyImpulse(wakeImpulse * math.max(1, root.AssemblyMass))
+				root:ApplyImpulse(FALL_WAKE_DELTA_VELOCITY * math.max(1, root.AssemblyMass))
 			end
 		end)
 	end
@@ -714,7 +713,7 @@ local function retireRecord(record: Record, context: BudgetContext?)
 	end
 end
 
-local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetContext)
+local function rebuildRecord(record: Record, context: BudgetContext)
 	local grid = getRecordGrid(record, context)
 	local oldCFrame = record.part.CFrame
 	local oldSize = record.part.Size
@@ -784,7 +783,7 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 	builder:flushBulkMoves()
 	addMs("supportMs", startedAt, context)
 	addProfileCount(context, "unsupportedRoots", #refreshResult.unsupportedRoots)
-	applyImpulseToRoots(refreshResult.unsupportedRoots, impulse)
+	applyWakeToRoots(refreshResult.unsupportedRoots)
 end
 
 local function processRecordDamage(record: Record, removed: { RemovedVoxel }, impulse: Vector3?, context: BudgetContext)
@@ -796,7 +795,7 @@ local function processRecordDamage(record: Record, removed: { RemovedVoxel }, im
 	local startedAt = os.clock()
 	fireDebris(record, removed, impulse, context)
 	addMs("debrisMs", startedAt, context)
-	rebuildRecord(record, impulse, context)
+	rebuildRecord(record, context)
 end
 
 local function processSphere(context: BudgetContext, job: DestroySphereJob)
