@@ -10,7 +10,7 @@ local CONTACT_PADDING = 0.015
 local supportIslandSerial = 0
 
 export type RefreshResult = {
-	unsupportedNewRoots: { BasePart },
+	unsupportedRoots: { BasePart },
 }
 
 type GraphComponent = {
@@ -159,6 +159,12 @@ local function collectDirtyParts(
 		for _, neighbor in registry:getContactNeighbors(seedPart) do
 			appendActivePart(registry, dirtyParts, dirtySet, neighbor)
 		end
+		local weldPeers = registry:getWeldPeerSet(seedPart)
+		if weldPeers then
+			for peer in weldPeers do
+				appendActivePart(registry, dirtyParts, dirtySet, peer)
+			end
+		end
 	end
 
 	if queryCFrame and querySize then
@@ -231,6 +237,16 @@ local function collectGraphComponents(registry: any, seedParts: { BasePart }, ne
 					end
 				end
 			end
+
+			local weldPeers = registry:getWeldPeerSet(part)
+			if weldPeers then
+				for peer in weldPeers do
+					if not visited[peer] and isActiveVoxelPart(registry, peer) then
+						visited[peer] = true
+						queue[#queue + 1] = peer
+					end
+				end
+			end
 		end
 
 		local oldAssembly = if oldAssemblyKinds == 1 then onlyOldAssembly else nil
@@ -274,8 +290,17 @@ function SupportGraph.refreshAroundDamage(
 	context: any?
 ): RefreshResult
 	local result: RefreshResult = {
-		unsupportedNewRoots = {},
+		unsupportedRoots = {},
 	}
+	local unsupportedRootSet: { [BasePart]: boolean } = {}
+
+	local function addUnsupportedRoot(root: BasePart?)
+		if not root or unsupportedRootSet[root] then
+			return
+		end
+		unsupportedRootSet[root] = true
+		result.unsupportedRoots[#result.unsupportedRoots + 1] = root
+	end
 
 	local dirtyParts, newPartSet = collectDirtyParts(registry, seedParts, queryCFrame, querySize, newParts, context)
 	if #dirtyParts <= 0 then
@@ -408,10 +433,17 @@ function SupportGraph.refreshAroundDamage(
 		end
 	end
 
-	-- Sweep any stray (untracked) WeldConstraints parented under changed parts.
+	-- Sweep stray library-authored WeldConstraints parented under changed parts.
+	-- User-authored welds (no `_PartBreaker2Weld` attribute) are intentional and
+	-- must survive damage so support can walk through them.
 	for _, part in changedParts do
 		for _, child in part:GetChildren() do
-			if child:IsA("WeldConstraint") and not claimedSet[child] and child.Parent ~= nil then
+			if
+				child:IsA("WeldConstraint")
+				and not claimedSet[child]
+				and child.Parent ~= nil
+				and child:GetAttribute("_PartBreaker2Weld") == true
+			then
 				if context then
 					context:consume("weldOps", 1)
 					context.stats.weldsDestroyed += 1
@@ -451,6 +483,7 @@ function SupportGraph.refreshAroundDamage(
 				local weld = Instance.new("WeldConstraint")
 				weld.Part0 = root
 				weld.Part1 = part
+				weld:SetAttribute("_PartBreaker2Weld", true)
 				weld.Parent = root
 				registry:registerWeld(assembly.id, weld)
 			end
@@ -477,12 +510,13 @@ function SupportGraph.refreshAroundDamage(
 			local weld = Instance.new("WeldConstraint")
 			weld.Part0 = plan.root
 			weld.Part1 = weldPlan.part
+			weld:SetAttribute("_PartBreaker2Weld", true)
 			weld.Parent = plan.root
 			registry:registerWeld(assemblyId, weld)
 		end
 	end
 
-	-- Phase 5: per-part attributes & anchoring; collect unsupported new roots.
+	-- Phase 5: per-part attributes & anchoring; collect unsupported roots.
 	for _, component in augmentAssemblies do
 		local assembly = component.augmentAssembly
 		supportIslandSerial += 1
@@ -501,8 +535,8 @@ function SupportGraph.refreshAroundDamage(
 		end
 
 		local augmentRoot: BasePart? = assembly.rootPart
-		if not component.supported and component.containsNewPart and augmentRoot then
-			result.unsupportedNewRoots[#result.unsupportedNewRoots + 1] = augmentRoot
+		if not component.supported then
+			addUnsupportedRoot(augmentRoot)
 		end
 	end
 
@@ -523,8 +557,8 @@ function SupportGraph.refreshAroundDamage(
 			part:SetAttribute("PartBreaker2ContactIslandId", islandId)
 		end
 
-		if not supported and plan.component.containsNewPart then
-			result.unsupportedNewRoots[#result.unsupportedNewRoots + 1] = plan.root
+		if not supported then
+			addUnsupportedRoot(plan.root)
 		end
 	end
 

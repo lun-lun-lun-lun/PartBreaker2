@@ -12,6 +12,7 @@ local Connectivity = require(script.Connectivity)
 local DamageSolver = require(script.DamageSolver)
 local GreedyMesher = require(script.GreedyMesher)
 local JobScheduler = require(script.JobScheduler)
+local ShapeTests = require(script.ShapeTests)
 local SupportGraph = require(script.SupportGraph)
 local VoxelGrid = require(script.VoxelGrid)
 local VoxelRegistry = require(script.VoxelRegistry)
@@ -29,6 +30,7 @@ type RuntimeBudgets = Types.RuntimeBudgets
 type RuntimeStats = Types.RuntimeStats
 type BudgetContext = Types.BudgetContext
 type RemovedVoxel = Types.RemovedVoxel
+type BuiltAssembly = Types.BuiltAssembly
 type Record = VoxelRegistry.Record
 
 type DestructionProfile = {
@@ -39,10 +41,22 @@ type DestructionProfile = {
 	timings: { [string]: number },
 }
 
+type AuthoredWeldDescriptor = {
+	other: BasePart,
+	name: string,
+}
+
+type AssemblyWeldCandidate = {
+	root: BasePart,
+	gap: number,
+}
+
 local DEBRIS_REMOTE_NAME = "PartBreaker2DebrisEvent"
 local NETWORK_FOLDER_NAME = "PartBreaker2Net"
 local DEBUG_STATS_INTERVAL = 0.75
 local DEFAULT_DEBRIS_LOD_RADIUS = 200
+local WELD_MIGRATION_TOUCH_PADDING = 0.015
+local FALL_WAKE_DELTA_VELOCITY = Vector3.new(0, -0.05, 0)
 
 local runtimeFolder = ChunkBuilder.ensureRuntimeFolder()
 local registry = VoxelRegistry.new()
@@ -417,16 +431,211 @@ local function appendAssemblyParts(parts: { BasePart }, seen: { [BasePart]: bool
 	end
 end
 
-local function applyImpulseToRoots(roots: { BasePart }, impulse: Vector3?)
-	if not impulse or impulse.Magnitude <= 0 then
+local function isExternalSupportPart(part: BasePart): boolean
+	if part.Parent == nil then
+		return false
+	end
+
+	if part:GetAttribute("PartBreaker2SupportAnchor") == true then
+		return true
+	end
+
+	if registry.recordsBySource[part] ~= nil or part:GetAttribute("VoxelPart") == true then
+		return false
+	end
+
+	return part.Anchored
+end
+
+local function worldAabb(cframe: CFrame, size: Vector3): (Vector3, Vector3)
+	local half = size * 0.5
+	local right = cframe.RightVector
+	local up = cframe.UpVector
+	local look = cframe.LookVector
+	local extent = Vector3.new(
+		math.abs(right.X) * half.X + math.abs(up.X) * half.Y + math.abs(look.X) * half.Z,
+		math.abs(right.Y) * half.X + math.abs(up.Y) * half.Y + math.abs(look.Y) * half.Z,
+		math.abs(right.Z) * half.X + math.abs(up.Z) * half.Y + math.abs(look.Z) * half.Z
+	)
+
+	return cframe.Position - extent, cframe.Position + extent
+end
+
+local function axisGap(minA: number, maxA: number, minB: number, maxB: number): number
+	if maxA < minB then
+		return minB - maxA
+	end
+	if maxB < minA then
+		return minA - maxB
+	end
+	return 0
+end
+
+local function partSurfaceGap(part: BasePart, other: BasePart): number
+	if ShapeTests.partsTouch(part.CFrame, part.Size, other.CFrame, other.Size, WELD_MIGRATION_TOUCH_PADDING) then
+		return 0
+	end
+
+	local minA, maxA = worldAabb(part.CFrame, part.Size)
+	local minB, maxB = worldAabb(other.CFrame, other.Size)
+	local dx = axisGap(minA.X, maxA.X, minB.X, maxB.X)
+	local dy = axisGap(minA.Y, maxA.Y, minB.Y, maxB.Y)
+	local dz = axisGap(minA.Z, maxA.Z, minB.Z, maxB.Z)
+	return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+-- Authored welds touching a dying source part are destroyed during retirement.
+-- Capture enough information to recreate them on the surviving replacement
+-- assemblies, regardless of where the original WeldConstraint was parented.
+local function collectAuthoredWelds(sourcePart: BasePart): { AuthoredWeldDescriptor }
+	local descriptors = {} :: { AuthoredWeldDescriptor }
+	local seen: { [WeldConstraint]: boolean } = {}
+
+	for _, weld in registry:collectWeldsTouchingPart(sourcePart) do
+		if seen[weld] or weld:GetAttribute("_PartBreaker2Weld") == true then
+			continue
+		end
+		seen[weld] = true
+
+		local part0 = weld.Part0
+		local part1 = weld.Part1
+		if not part0 or not part1 then
+			continue
+		end
+
+		local other: BasePart? = nil
+		if part0 == sourcePart then
+			other = part1
+		elseif part1 == sourcePart then
+			other = part0
+		end
+
+		if other and other ~= sourcePart and other.Parent ~= nil then
+			descriptors[#descriptors + 1] = {
+				other = other,
+				name = weld.Name,
+			}
+		end
+	end
+
+	return descriptors
+end
+
+local function closestCandidate(candidates: { AssemblyWeldCandidate }): AssemblyWeldCandidate?
+	local closest = nil :: AssemblyWeldCandidate?
+	local closestGap = math.huge
+	for _, candidate in candidates do
+		if candidate.gap < closestGap then
+			closestGap = candidate.gap
+			closest = candidate
+		end
+	end
+	return closest
+end
+
+local function getWeldTargets(other: BasePart, builtAssemblies: { BuiltAssembly }): { BasePart }
+	local allCandidates = {} :: { AssemblyWeldCandidate }
+	local touchingCandidates = {} :: { AssemblyWeldCandidate }
+
+	for _, assembly in builtAssemblies do
+		local root = assembly.rootPart
+		if not root or root.Parent == nil then
+			continue
+		end
+
+		local bestGap = math.huge
+		for _, part in assembly.parts do
+			if part.Parent == nil then
+				continue
+			end
+
+			local gap = partSurfaceGap(part, other)
+			if gap < bestGap then
+				bestGap = gap
+			end
+		end
+
+		if bestGap == math.huge then
+			continue
+		end
+
+		local candidate: AssemblyWeldCandidate = {
+			root = root,
+			gap = bestGap,
+		}
+		allCandidates[#allCandidates + 1] = candidate
+		if bestGap <= WELD_MIGRATION_TOUCH_PADDING then
+			touchingCandidates[#touchingCandidates + 1] = candidate
+		end
+	end
+
+	local targets = {} :: { BasePart }
+	if #touchingCandidates > 0 then
+		if isExternalSupportPart(other) then
+			for _, candidate in touchingCandidates do
+				targets[#targets + 1] = candidate.root
+			end
+		else
+			local closestTouching = closestCandidate(touchingCandidates)
+			if closestTouching then
+				targets[#targets + 1] = closestTouching.root
+			end
+		end
+		return targets
+	end
+
+	local nearest = closestCandidate(allCandidates)
+	if nearest then
+		targets[#targets + 1] = nearest.root
+	end
+	return targets
+end
+
+local function migrateAuthoredWelds(descriptors: { AuthoredWeldDescriptor }, builtAssemblies: { BuiltAssembly }, context: BudgetContext?)
+	if #descriptors <= 0 or #builtAssemblies <= 0 then
 		return
 	end
 
+	local createdByOther: { [BasePart]: { [BasePart]: boolean } } = {}
+	for _, descriptor in descriptors do
+		local other = descriptor.other
+		if other.Parent == nil then
+			continue
+		end
+
+		local rootSet = createdByOther[other]
+		if not rootSet then
+			rootSet = {} :: { [BasePart]: boolean }
+			createdByOther[other] = rootSet
+		end
+
+		for _, root in getWeldTargets(other, builtAssemblies) do
+			if rootSet[root] or root.Parent == nil or other.Parent == nil then
+				continue
+			end
+			rootSet[root] = true
+
+			if context then
+				context:consume("weldOps", 1)
+				context.stats.weldsCreated += 1
+			end
+
+			local migrated = Instance.new("WeldConstraint")
+			migrated.Name = descriptor.name
+			migrated.Part0 = root
+			migrated.Part1 = other
+			migrated.Parent = root
+			registry:trackWeld(migrated)
+		end
+	end
+end
+
+local function applyImpulseToRoots(roots: { BasePart }, impulse: Vector3?)
+	local wakeImpulse = if impulse and impulse.Magnitude > 0 then impulse else FALL_WAKE_DELTA_VELOCITY
 	for _, root in roots do
-		local scaledImpulse = impulse * math.max(1, root.AssemblyMass)
 		task.defer(function()
 			if root.Parent ~= nil and not root.Anchored then
-				root:ApplyImpulse(scaledImpulse)
+				root:ApplyImpulse(wakeImpulse * math.max(1, root.AssemblyMass))
 			end
 		end)
 	end
@@ -537,6 +746,8 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 	local newParts = table.create(16) :: { BasePart }
 	local newPartSet: { [BasePart]: boolean } = {}
 
+	local authoredWelds = collectAuthoredWelds(record.part)
+
 	startedAt = os.clock()
 	local builtAssemblies = builder:buildChunks(record, components, context, inheritedConfig.lazyGeneratedGrid ~= false)
 	retireRecord(record, context)
@@ -556,6 +767,7 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 			registry:registerPart(model, chunk)
 		end
 	end
+	migrateAuthoredWelds(authoredWelds, builtAssemblies, context)
 	builder:flushBulkMoves()
 	addMs("commitMs", startedAt, context)
 
@@ -571,9 +783,8 @@ local function rebuildRecord(record: Record, impulse: Vector3?, context: BudgetC
 	)
 	builder:flushBulkMoves()
 	addMs("supportMs", startedAt, context)
-	addProfileCount(context, "unsupportedRoots", #refreshResult.unsupportedNewRoots)
-
-	applyImpulseToRoots(refreshResult.unsupportedNewRoots, impulse)
+	addProfileCount(context, "unsupportedRoots", #refreshResult.unsupportedRoots)
+	applyImpulseToRoots(refreshResult.unsupportedRoots, impulse)
 end
 
 local function processRecordDamage(record: Record, removed: { RemovedVoxel }, impulse: Vector3?, context: BudgetContext)

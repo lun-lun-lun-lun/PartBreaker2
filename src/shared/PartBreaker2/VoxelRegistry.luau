@@ -58,6 +58,9 @@ export type Registry = typeof(setmetatable(
 		directSupportByPart: { [BasePart]: boolean },
 		supportContactsValid: { [BasePart]: boolean },
 		externalSupportValid: { [BasePart]: boolean },
+		weldsByPart: { [BasePart]: { [WeldConstraint]: true } },
+		weldDestroyingByWeld: { [WeldConstraint]: RBXScriptConnection },
+		weldChildAddedByPart: { [BasePart]: RBXScriptConnection },
 		pendingConfig: { [BasePart]: VoxelPartConfig },
 		overlapParams: OverlapParams,
 		maxBroadphaseParts: number,
@@ -73,10 +76,6 @@ local DEFAULT_DEBRIS_LIFETIME = 2.5
 local DEFAULT_DEBRIS_IMPULSE_MULTIPLIER = 1
 local SUPPORT_HASH_CELL_SIZE = 16
 local CONTACT_PADDING = 0.015
-
-local function expandedSize(part: BasePart): Vector3
-	return part.Size + Vector3.new(CONTACT_PADDING * 2, CONTACT_PADDING * 2, CONTACT_PADDING * 2)
-end
 
 local function numberAttribute(part: Instance, name: string, fallback: number): number
 	local value = part:GetAttribute(name)
@@ -163,6 +162,9 @@ function VoxelRegistry.new(): Registry
 		directSupportByPart = {} :: { [BasePart]: boolean },
 		supportContactsValid = {} :: { [BasePart]: boolean },
 		externalSupportValid = {} :: { [BasePart]: boolean },
+		weldsByPart = {} :: { [BasePart]: { [WeldConstraint]: true } },
+		weldDestroyingByWeld = {} :: { [WeldConstraint]: RBXScriptConnection },
+		weldChildAddedByPart = {} :: { [BasePart]: RBXScriptConnection },
 		pendingConfig = {} :: { [BasePart]: VoxelPartConfig },
 		overlapParams = overlapParams,
 		maxBroadphaseParts = 0,
@@ -202,6 +204,130 @@ local function addContactEdge(self: Registry, a: BasePart, b: BasePart, context:
 	end
 end
 
+local unindexWeld
+
+local function indexWeld(self: Registry, weld: WeldConstraint)
+	local part0 = weld.Part0
+	local part1 = weld.Part1
+	if not part0 or not part1 or part0 == part1 then
+		return
+	end
+
+	local set0 = self.weldsByPart[part0]
+	if not set0 then
+		set0 = {} :: { [WeldConstraint]: true }
+		self.weldsByPart[part0] = set0
+	end
+	set0[weld] = true
+
+	local set1 = self.weldsByPart[part1]
+	if not set1 then
+		set1 = {} :: { [WeldConstraint]: true }
+		self.weldsByPart[part1] = set1
+	end
+	set1[weld] = true
+
+	self.externalSupportValid[part0] = nil
+	self.externalSupportValid[part1] = nil
+
+	if not self.weldDestroyingByWeld[weld] then
+		self.weldDestroyingByWeld[weld] = weld.Destroying:Connect(function()
+			unindexWeld(self, weld)
+		end)
+	end
+end
+
+function unindexWeld(self: Registry, weld: WeldConstraint)
+	local conn = self.weldDestroyingByWeld[weld]
+	if conn then
+		conn:Disconnect()
+		self.weldDestroyingByWeld[weld] = nil
+	end
+
+	local part0 = weld.Part0
+	if part0 then
+		local set0 = self.weldsByPart[part0]
+		if set0 then
+			set0[weld] = nil
+			self.externalSupportValid[part0] = nil
+		end
+	end
+
+	local part1 = weld.Part1
+	if part1 then
+		local set1 = self.weldsByPart[part1]
+		if set1 then
+			set1[weld] = nil
+			self.externalSupportValid[part1] = nil
+		end
+	end
+end
+
+function VoxelRegistry.trackWeld(self: Registry, weld: WeldConstraint)
+	indexWeld(self, weld)
+end
+
+function VoxelRegistry.collectWeldsTouchingPart(self: Registry, part: BasePart): { WeldConstraint }
+	local found = {} :: { WeldConstraint }
+	local seen: { [WeldConstraint]: boolean } = {}
+
+	local indexed = self.weldsByPart[part]
+	if indexed then
+		for weld in indexed do
+			if weld.Parent ~= nil and (weld.Part0 == part or weld.Part1 == part) then
+				seen[weld] = true
+				found[#found + 1] = weld
+			end
+		end
+	end
+
+	for _, descendant in Workspace:GetDescendants() do
+		if not descendant:IsA("WeldConstraint") then
+			continue
+		end
+
+		local weld = descendant :: WeldConstraint
+		if seen[weld] then
+			continue
+		end
+
+		if weld.Part0 == part or weld.Part1 == part then
+			self:trackWeld(weld)
+			seen[weld] = true
+			found[#found + 1] = weld
+		end
+	end
+
+	return found
+end
+
+local function scanPartForWelds(self: Registry, part: BasePart)
+	for _, child in part:GetChildren() do
+		if child:IsA("WeldConstraint") then
+			self:trackWeld(child)
+		end
+	end
+end
+
+local function attachWeldChildWatcher(self: Registry, part: BasePart)
+	if self.weldChildAddedByPart[part] then
+		return
+	end
+	self.weldChildAddedByPart[part] = part.ChildAdded:Connect(function(child)
+		if child:IsA("WeldConstraint") then
+			self:trackWeld(child)
+		end
+	end)
+end
+
+local function detachWeldChildWatcher(self: Registry, part: BasePart)
+	local conn = self.weldChildAddedByPart[part]
+	if conn then
+		conn:Disconnect()
+		self.weldChildAddedByPart[part] = nil
+	end
+end
+
 function VoxelRegistry.removeSupportPart(self: Registry, part: BasePart)
 	self.supportHash:remove(part)
 
@@ -219,6 +345,19 @@ function VoxelRegistry.removeSupportPart(self: Registry, part: BasePart)
 	self.directSupportByPart[part] = nil
 	self.supportContactsValid[part] = nil
 	self.externalSupportValid[part] = nil
+
+	detachWeldChildWatcher(self, part)
+	local welds = self.weldsByPart[part]
+	if welds then
+		local snapshot = {} :: { WeldConstraint }
+		for weld in welds do
+			snapshot[#snapshot + 1] = weld
+		end
+		for _, weld in snapshot do
+			unindexWeld(self, weld)
+		end
+	end
+	self.weldsByPart[part] = nil
 end
 
 function VoxelRegistry.getContactNeighborSet(self: Registry, part: BasePart): { [BasePart]: true }?
@@ -242,6 +381,27 @@ end
 
 function VoxelRegistry.hasDirectSupport(self: Registry, part: BasePart): boolean
 	return self.directSupportByPart[part] == true
+end
+
+function VoxelRegistry.getWeldPeerSet(self: Registry, part: BasePart): { [BasePart]: true }?
+	local welds = self.weldsByPart[part]
+	if not welds then
+		return nil
+	end
+
+	local result = {} :: { [BasePart]: true }
+	for weld in welds do
+		local other: BasePart? = nil
+		if weld.Part0 == part then
+			other = weld.Part1
+		elseif weld.Part1 == part then
+			other = weld.Part0
+		end
+		if other and self:isActiveVoxelPart(other) then
+			result[other] = true
+		end
+	end
+	return result
 end
 
 function VoxelRegistry.getNearbySupportParts(self: Registry, cframe: CFrame, size: Vector3, padding: number?, context: any?): { BasePart }
@@ -291,7 +451,6 @@ function VoxelRegistry.rebuildSupportContacts(self: Registry, parts: { BasePart 
 		end
 	end
 
-	local overlapParams = self.overlapParams
 	for _, part in dirtyParts do
 		local partCFrame = part.CFrame
 		local partSize = part.Size
@@ -318,37 +477,27 @@ function VoxelRegistry.rebuildSupportContacts(self: Registry, parts: { BasePart 
 			end
 		end
 
-		-- External-support workspace query is the most expensive step here
-		-- (it crosses into the engine spatial index for every dirty part).
-		-- Skip it entirely when our cached answer is still valid.
+		-- Support source-of-truth: a weld whose other endpoint is an anchored
+		-- non-voxel (e.g. baseplate). Walking the per-part weld index is O(weld
+		-- count) and avoids the workspace query that used to live here.
 		if not self.externalSupportValid[part] then
-			if context then
-				context:consume("supportQueries", 1)
-				context.stats.supportQueries += 1
-				context.stats.supportWorkspaceQueries += 1
-			end
-			for _, nearbyPart in Workspace:GetPartBoundsInBox(partCFrame, expandedSize(part), overlapParams) do
-				if not nearbyPart:IsA("BasePart") or nearbyPart == part then
-					continue
-				end
-				if not isExternalSupport(self, nearbyPart) then
-					continue
-				end
-
-				if context then
-					context.stats.supportContactTests += 1
-				end
-				local nearbyCFrame = nearbyPart.CFrame
-				local nearbySize = nearbyPart.Size
-				local touch
-				if partAligned and ShapeTests.isAxisAligned(nearbyCFrame) then
-					touch = ShapeTests.partsTouchAabb(partCFrame, partSize, nearbyCFrame, nearbySize, CONTACT_PADDING)
-				else
-					touch = ShapeTests.partsTouchSat(partCFrame, partSize, nearbyCFrame, nearbySize, CONTACT_PADDING)
-				end
-				if touch then
-					self.directSupportByPart[part] = true
-					break
+			self.directSupportByPart[part] = false
+			local welds = self.weldsByPart[part]
+			if welds then
+				for weld in welds do
+					local other: BasePart? = nil
+					if weld.Part0 == part then
+						other = weld.Part1
+					elseif weld.Part1 == part then
+						other = weld.Part0
+					end
+					if other and isExternalSupport(self, other) then
+						if context then
+							context.stats.supportContactTests += 1
+						end
+						self.directSupportByPart[part] = true
+						break
+					end
 				end
 			end
 			self.externalSupportValid[part] = true
@@ -363,7 +512,7 @@ function VoxelRegistry.invalidateExternalSupport(self: Registry, part: BasePart)
 end
 
 function VoxelRegistry.ensureSupportContacts(self: Registry, part: BasePart, context: any?)
-	if self.supportContactsValid[part] and self:isActiveVoxelPart(part) then
+	if self.supportContactsValid[part] and self.externalSupportValid[part] and self:isActiveVoxelPart(part) then
 		return
 	end
 
@@ -409,7 +558,12 @@ end
 
 function VoxelRegistry.registerWeld(self: Registry, assemblyId: number, weld: WeldConstraint)
 	local assembly = self.assembliesById[assemblyId]
-	if not assembly or assembly.welds[weld] then
+	if not assembly then
+		return
+	end
+
+	self:trackWeld(weld)
+	if assembly.welds[weld] then
 		return
 	end
 
@@ -487,6 +641,18 @@ function VoxelRegistry.destroyWeldsTouchingParts(self: Registry, parts: { BasePa
 					context.stats.weldsDestroyed += 1
 				end
 				child:Destroy()
+			end
+		end
+
+		-- Authored welds can be parented under the anchor or another folder.
+		-- Scan Workspace too so no hidden source keeps zombie weld endpoints.
+		for _, weld in self:collectWeldsTouchingPart(part) do
+			if weld.Parent ~= nil then
+				if context then
+					context:consume("weldOps", 1)
+					context.stats.weldsDestroyed += 1
+				end
+				weld:Destroy()
 			end
 		end
 	end
@@ -679,6 +845,8 @@ function VoxelRegistry.registerPart(self: Registry, model: Model, part: BasePart
 	self.recordsByQueryPart[part] = record
 	self.supportHash:insert(part)
 	self.supportContactsValid[part] = false
+	scanPartForWelds(self, part)
+	attachWeldChildWatcher(self, part)
 	part:SetAttribute("_PartBreaker2Registered", true)
 	part:SetAttribute("PartBreaker2AssemblyId", record.assemblyId)
 	part:SetAttribute("PartBreaker2Supported", record.supported)
